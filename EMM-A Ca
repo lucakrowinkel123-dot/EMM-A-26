@@ -78,7 +78,7 @@ IMyTimerBlock _cachedPathTimer;
 IMyTimerBlock _cachedZoneDbTimer;
 
 bool goToMode = false;
-int goToStage = 0; // 1 = flying to safe side-point, 2 = final approach to saved carrier pose
+int goToStage = 0; // 1 = orient to side-point, 2 = move to side-point, 3 = orient to final pos, 4 = move to final pos, 5 = final orientation
 
 public Program()
 {
@@ -876,9 +876,9 @@ void HandleGoTo(string argument)
     }
 
     Vector3D chosenPoint = frontIntersects ? backPoint : frontPoint;
-    targetPosition   = chosenPoint;
-    desiredForward   = Vector3D.Zero;
-    desiredUp        = savedUp;
+    targetPosition   = rc.GetPosition();
+    desiredForward   = DirectionOrFallback(rc.GetPosition(), chosenPoint, rc.WorldMatrix.Forward);
+    desiredUp        = Vector3D.Zero;
     hasTarget        = true;
     autopilotEnabled = true;
     Runtime.UpdateFrequency = tickSpeed;
@@ -893,35 +893,77 @@ void HandleGoTo(string argument)
     _goToFinalPosition = savedPos;
     _goToFinalForward  = savedForward;
     _goToFinalUp       = savedUp;
+    _goToChosenPoint   = chosenPoint;
 
-    Echo($"GoTo: Asteroid {asteroidNum:D3} using {(frontIntersects ? "rear" : "front")} approach point.");
+    Echo($"GoTo: Asteroid {asteroidNum:D3} using {(frontIntersects ? "rear" : "front")} approach point. Orienting toward approach.");
 }
 
 Vector3D _goToFinalPosition = Vector3D.Zero;
 Vector3D _goToFinalForward  = Vector3D.Zero;
 Vector3D _goToFinalUp       = Vector3D.Zero;
+Vector3D _goToChosenPoint   = Vector3D.Zero;
 
 void UpdateGoToRunner()
 {
     if (!goToMode || !autopilotEnabled || !hasTarget)
         return;
 
-    if (goToStage == 1 && IsAtTargetPosition(targetPosition))
+    if (goToStage == 1 && IsOrientationAligned(desiredForward, desiredUp, orientationToleranceDeg))
+    {
+        targetPosition = _goToChosenPoint;
+        desiredForward = DirectionOrFallback(rc.GetPosition(), _goToChosenPoint, rc.WorldMatrix.Forward);
+        desiredUp      = Vector3D.Zero;
+        goToStage      = 2;
+        Echo("GoTo: aligned to approach point. Moving to side-point.");
+        return;
+    }
+
+    if (goToStage == 2 && IsAtTargetPosition(_goToChosenPoint))
+    {
+        targetPosition = rc.GetPosition();
+        desiredForward = DirectionOrFallback(rc.GetPosition(), _goToFinalPosition, rc.WorldMatrix.Forward);
+        desiredUp      = Vector3D.Zero;
+        goToStage      = 3;
+        Echo("GoTo: side-point reached. Orienting toward saved carrier position.");
+        return;
+    }
+
+    if (goToStage == 3 && IsOrientationAligned(desiredForward, desiredUp, orientationToleranceDeg))
+    {
+        targetPosition = _goToFinalPosition;
+        desiredForward = DirectionOrFallback(rc.GetPosition(), _goToFinalPosition, rc.WorldMatrix.Forward);
+        desiredUp      = Vector3D.Zero;
+        goToStage      = 4;
+        Echo("GoTo: aligned to saved position. Moving to saved carrier position.");
+        return;
+    }
+
+    if (goToStage == 4 && IsAtTargetPosition(_goToFinalPosition))
     {
         targetPosition = _goToFinalPosition;
         desiredForward = _goToFinalForward;
         desiredUp      = _goToFinalUp;
-        goToStage      = 2;
-        Echo("GoTo: side-point reached. Starting final approach.");
+        goToStage      = 5;
+        Echo("GoTo: saved position reached. Aligning to saved carrier orientation.");
         return;
     }
 
-    if (goToStage == 2 && IsAtTargetPose(_goToFinalPosition, _goToFinalForward, _goToFinalUp))
+    if (goToStage == 5 && IsOrientationAligned(_goToFinalForward, _goToFinalUp, orientationToleranceDeg))
     {
         goToMode      = false;
         goToStage     = 0;
         Echo("GoTo: final pose reached.");
     }
+}
+
+Vector3D DirectionOrFallback(Vector3D from, Vector3D to, Vector3D fallback)
+{
+    Vector3D d = to - from;
+    if (d.LengthSquared() > 1e-6)
+        return Vector3D.Normalize(d);
+    if (fallback.LengthSquared() > 1e-6)
+        return Vector3D.Normalize(fallback);
+    return Vector3D.Forward;
 }
 
 bool TryGetCarrierPoseFromZoneDb(int asteroidNum, out Vector3D pos, out Vector3D forward, out Vector3D up)
