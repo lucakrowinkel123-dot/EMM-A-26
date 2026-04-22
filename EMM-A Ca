@@ -878,7 +878,7 @@ void HandleGoTo(string argument)
     Vector3D chosenPoint = frontIntersects ? backPoint : frontPoint;
     targetPosition   = rc.GetPosition();
     desiredForward   = DirectionOrFallback(rc.GetPosition(), chosenPoint, rc.WorldMatrix.Forward);
-    desiredUp        = savedUp;
+    desiredUp        = Vector3D.Zero;
     hasTarget        = true;
     autopilotEnabled = true;
     Runtime.UpdateFrequency = tickSpeed;
@@ -912,7 +912,7 @@ void UpdateGoToRunner()
     {
         targetPosition = _goToChosenPoint;
         desiredForward = DirectionOrFallback(rc.GetPosition(), _goToChosenPoint, rc.WorldMatrix.Forward);
-        desiredUp      = _goToFinalUp;
+        desiredUp      = Vector3D.Zero;
         goToStage      = 2;
         Echo("GoTo: aligned to approach point. Moving to side-point.");
         return;
@@ -922,7 +922,7 @@ void UpdateGoToRunner()
     {
         targetPosition = rc.GetPosition();
         desiredForward = DirectionOrFallback(rc.GetPosition(), _goToFinalPosition, rc.WorldMatrix.Forward);
-        desiredUp      = _goToFinalUp;
+        desiredUp      = Vector3D.Zero;
         goToStage      = 3;
         Echo("GoTo: side-point reached. Orienting toward saved carrier position.");
         return;
@@ -932,7 +932,7 @@ void UpdateGoToRunner()
     {
         targetPosition = _goToFinalPosition;
         desiredForward = DirectionOrFallback(rc.GetPosition(), _goToFinalPosition, rc.WorldMatrix.Forward);
-        desiredUp      = _goToFinalUp;
+        desiredUp      = Vector3D.Zero;
         goToStage      = 4;
         Echo("GoTo: aligned to saved position. Moving to saved carrier position.");
         return;
