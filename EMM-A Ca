@@ -78,7 +78,7 @@ IMyTimerBlock _cachedPathTimer;
 IMyTimerBlock _cachedZoneDbTimer;
 
 bool goToMode = false;
-int goToStage = 0; // 1 = flying to safe side-point, 2 = orienting at side-point toward saved carrier position, 3 = final approach to saved carrier pose
+int goToStage = 0; // 1 = flying to safe side-point, 2 = final approach while facing saved carrier position, 3 = aligning to saved carrier orientation at final position
 
 public Program()
 {
@@ -909,27 +909,21 @@ void UpdateGoToRunner()
     if (goToStage == 1 && IsAtTargetPosition(targetPosition))
     {
         Vector3D toFinal = _goToFinalPosition - rc.GetPosition();
-        desiredForward = toFinal.LengthSquared() > 0.001 ? Vector3D.Normalize(toFinal) : _goToFinalForward;
+        targetPosition = _goToFinalPosition;
         desiredUp      = _goToFinalUp;
+        desiredForward = ComputeApproachFacingForward(toFinal, desiredUp, _goToFinalForward);
         goToStage      = 2;
-        Echo("GoTo: side-point reached. Orienting toward saved carrier position.");
+        Echo("GoTo: side-point reached. Starting final approach while facing saved carrier position.");
         return;
     }
 
-    if (goToStage == 2)
+    if (goToStage == 2 && IsAtTargetPosition(_goToFinalPosition))
     {
-        Vector3D toFinal = _goToFinalPosition - rc.GetPosition();
-        desiredForward = toFinal.LengthSquared() > 0.001 ? Vector3D.Normalize(toFinal) : _goToFinalForward;
-
-        if (IsOrientationAligned(desiredForward, desiredUp, orientationToleranceDeg))
-        {
-            targetPosition = _goToFinalPosition;
-            desiredForward = _goToFinalForward;
-            desiredUp      = _goToFinalUp;
-            goToStage      = 3;
-            Echo("GoTo: orientation set. Starting final approach.");
-            return;
-        }
+        desiredForward = _goToFinalForward;
+        desiredUp      = _goToFinalUp;
+        goToStage      = 3;
+        Echo("GoTo: final position reached. Aligning to saved orientation.");
+        return;
     }
 
     if (goToStage == 3 && IsAtTargetPose(_goToFinalPosition, _goToFinalForward, _goToFinalUp))
@@ -938,6 +932,22 @@ void UpdateGoToRunner()
         goToStage     = 0;
         Echo("GoTo: final pose reached.");
     }
+}
+
+
+Vector3D ComputeApproachFacingForward(Vector3D toFinal, Vector3D up, Vector3D fallbackForward)
+{
+    Vector3D candidate = toFinal;
+    if (up.LengthSquared() > 0.001)
+        candidate = Vector3D.Reject(candidate, Vector3D.Normalize(up));
+
+    if (candidate.LengthSquared() > 0.001)
+        return Vector3D.Normalize(candidate);
+
+    if (fallbackForward.LengthSquared() > 0.001)
+        return Vector3D.Normalize(fallbackForward);
+
+    return rc.WorldMatrix.Forward;
 }
 
 bool TryGetCarrierPoseFromZoneDb(int asteroidNum, out Vector3D pos, out Vector3D forward, out Vector3D up)
