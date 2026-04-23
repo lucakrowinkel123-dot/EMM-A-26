@@ -208,8 +208,8 @@ public Program ()
     if (rc == null) // No cockpits found.
         throw new Exception("No cockpit/remote control found. Set the cockpitName field at the top of the script.");
 
-    allGyros = GetBlocks<IMyGyro>();
-    allThrusters = GetBlocks<IMyThrust>();
+    allGyros = GetBlocks<IMyGyro>().FindAll(b => HasMinerTag(b));
+    allThrusters = GetBlocks<IMyThrust>().FindAll(b => HasMinerTag(b));
     thrust = new ThrusterControl(rc, tickSpeed, allThrusters);
     gyros = new GyroControl(rc, tickSpeed, allGyros);
     drills = GetBlocks<IMyShipDrill>();
@@ -1169,8 +1169,8 @@ bool RefreshDockHardware()
 
 void RecompileFlightSystems()
 {
-    allGyros = GetBlocks<IMyGyro>();
-    allThrusters = GetBlocks<IMyThrust>();
+    allGyros = GetBlocks<IMyGyro>().FindAll(b => HasMinerTag(b));
+    allThrusters = GetBlocks<IMyThrust>().FindAll(b => HasMinerTag(b));
     thrust = new ThrusterControl(rc, tickSpeed, allThrusters);
     gyros = new GyroControl(rc, tickSpeed, allGyros);
 }
