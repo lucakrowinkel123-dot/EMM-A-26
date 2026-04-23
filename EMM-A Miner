@@ -918,10 +918,10 @@ void StartPathRecordUndo()
     for (int i = 0; i < removeCount; i++)
     {
         int idx = pathPoseIndexes[pathPoseIndexes.Count - 1 - i];
-        removeIdx.Add(idx);
         Vector3D p, f, u;
         if (TryParsePoseRecordLine(lines[idx], out p, out f, out u))
         {
+            removeIdx.Add(idx); // only remove points we can actually reverse through
             pathUndoTargetsPos.Add(p);
             pathUndoTargetsForward.Add(f);
             pathUndoTargetsUp.Add(u);
@@ -996,6 +996,7 @@ void StartPathRecordMineUndo()
     pathUndoTargetsPos.Clear();
     pathUndoTargetsForward.Clear();
     pathUndoTargetsUp.Clear();
+    HashSet<int> removablePostMinePathIndexes = new HashSet<int>();
 
     // Reverse through any path points recorded after the minearea record, then end at mine pose.
     for (int i = lines.Count - 1; i > mineIdx; i--)
@@ -1005,6 +1006,7 @@ void StartPathRecordMineUndo()
         Vector3D p, f, u;
         if (TryParsePoseRecordLine(lines[i], out p, out f, out u))
         {
+            removablePostMinePathIndexes.Add(i); // only remove points that were actually queued for reverse travel
             pathUndoTargetsPos.Add(p);
             pathUndoTargetsForward.Add(f);
             pathUndoTargetsUp.Add(u);
@@ -1019,7 +1021,7 @@ void StartPathRecordMineUndo()
     {
         if (i == mineIdx)
             continue; // remove the minearea record itself
-        if (i > mineIdx && IsPathPoseRecordLine(lines[i]))
+        if (removablePostMinePathIndexes.Contains(i))
             continue; // remove path points recorded after that minearea record
         pathUndoRewrittenLines.Add(lines[i]);
     }
