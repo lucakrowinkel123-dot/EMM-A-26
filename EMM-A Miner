@@ -17,6 +17,9 @@
 // pathcontinue : resumes queue advancement after pathpause
 // pathstop : stops path mode and clears remaining queued records
 // pathclear : clears the path timer CustomData and resets path recording counters
+// pathrecordpause : pauses/resumes path point recording without stopping the session
+// pathrecordundo : pauses recording, flies back through last 5 path points, removes them, then resumes recording
+// pathrecordmineundo : if within 50m of the last mine record corner, flies/orients there, removes that mine record and newer path points
 // dock : starts auto-dock sequence (requires fresh carrier connector broadcast and proximity to dock pose)
 // undock : disconnects and flies to shared dock pose while staying aligned
 // docksync <on|off> : toggle merge/connector sync behavior for dock/undock
@@ -197,6 +200,19 @@ bool _invCached = false;
 // Cached path timer reference to avoid repeated GTS scans during path recording
 IMyTimerBlock _cachedPathTimer;
 
+enum PathUndoMode
+{
+    None,
+    PathPoints,
+    MineRecord
+}
+PathUndoMode pathUndoMode = PathUndoMode.None;
+List<Vector3D> pathUndoTargetsPos = new List<Vector3D>();
+List<Vector3D> pathUndoTargetsForward = new List<Vector3D>();
+List<Vector3D> pathUndoTargetsUp = new List<Vector3D>();
+int pathUndoTargetIndex = 0;
+List<string> pathUndoRewrittenLines = new List<string>();
+
 public Program ()
 {
     // Prioritize the given cockpit name
@@ -208,8 +224,8 @@ public Program ()
     if (rc == null) // No cockpits found.
         throw new Exception("No cockpit/remote control found. Set the cockpitName field at the top of the script.");
 
-    allGyros = GetBlocks<IMyGyro>();
-    allThrusters = GetBlocks<IMyThrust>();
+    allGyros = GetBlocks<IMyGyro>().FindAll(b => HasMinerTag(b));
+    allThrusters = GetBlocks<IMyThrust>().FindAll(b => HasMinerTag(b));
     thrust = new ThrusterControl(rc, tickSpeed, allThrusters);
     gyros = new GyroControl(rc, tickSpeed, allGyros);
     drills = GetBlocks<IMyShipDrill>();
@@ -512,6 +528,21 @@ void RemoteCommand (string command)
         HandlePathRecordMineStep();
         return;
     }
+    if (trimmed.Equals("pathrecordpause", StringComparison.OrdinalIgnoreCase))
+    {
+        TogglePathRecordingPause();
+        return;
+    }
+    if (trimmed.Equals("pathrecordundo", StringComparison.OrdinalIgnoreCase))
+    {
+        StartPathRecordUndo();
+        return;
+    }
+    if (trimmed.Equals("pathrecordmineundo", StringComparison.OrdinalIgnoreCase))
+    {
+        StartPathRecordMineUndo();
+        return;
+    }
 
     switch (trimmed.ToLower())
     {
@@ -740,6 +771,9 @@ void StopPathRecording()
 
 bool UpdatePathRecordState()
 {
+    if (pathUndoMode != PathUndoMode.None)
+        return UpdatePathUndoState();
+
     if (pathRecordingEnabled && !pathRecordingPaused && !pathRecordingWaitReturn)
     {
         Vector3D now = rc.GetPosition();
@@ -823,6 +857,260 @@ bool UpdatePathRecordState()
     gyros.FaceVectors(forward, up);
     thrust.ApplyAccel(thrust.ControlPosition(allowed, Vector3D.Zero, SPEEDB));
     return true;
+}
+
+void TogglePathRecordingPause()
+{
+    if (!pathRecordingEnabled)
+    {
+        Echo("Path recording is not active. Use pathrecordstart first.");
+        return;
+    }
+    if (pathUndoMode != PathUndoMode.None)
+    {
+        Echo("Cannot toggle pause while undo navigation is active.");
+        return;
+    }
+    pathRecordingPaused = !pathRecordingPaused;
+    Echo(pathRecordingPaused ? "Path recording paused." : "Path recording resumed.");
+    if (!pathRecordingPaused)
+        pathRecordLastPos = rc.GetPosition();
+}
+
+void StartPathRecordUndo()
+{
+    if (pathUndoMode != PathUndoMode.None)
+    {
+        Echo("Undo already in progress.");
+        return;
+    }
+    if (pathRecordMineStage != PathRecordMineStage.Idle || pathRecordingWaitReturn)
+    {
+        Echo("Finish current pathrecordmine sequence before undo.");
+        return;
+    }
+
+    IMyTimerBlock timer = FindPathTimer();
+    if (timer == null)
+    {
+        Echo($"PathRecordUndo failed: timer tag '{pathTimerTag}' not found.");
+        return;
+    }
+
+    List<string> lines = SplitPathTimerLines(timer.CustomData);
+    List<int> pathPoseIndexes = new List<int>();
+    for (int i = 0; i < lines.Count; i++)
+        if (IsPathPoseRecordLine(lines[i]))
+            pathPoseIndexes.Add(i);
+
+    if (pathPoseIndexes.Count == 0)
+    {
+        Echo("PathRecordUndo failed: no path points to undo.");
+        return;
+    }
+
+    int removeCount = Math.Min(5, pathPoseIndexes.Count);
+    pathUndoTargetsPos.Clear();
+    pathUndoTargetsForward.Clear();
+    pathUndoTargetsUp.Clear();
+    HashSet<int> removeIdx = new HashSet<int>();
+
+    for (int i = 0; i < removeCount; i++)
+    {
+        int idx = pathPoseIndexes[pathPoseIndexes.Count - 1 - i];
+        Vector3D p, f, u;
+        if (TryParsePoseRecordLine(lines[idx], out p, out f, out u))
+        {
+            removeIdx.Add(idx); // only remove points we can actually reverse through
+            pathUndoTargetsPos.Add(p);
+            pathUndoTargetsForward.Add(f);
+            pathUndoTargetsUp.Add(u);
+        }
+    }
+
+    if (pathUndoTargetsPos.Count == 0)
+    {
+        Echo("PathRecordUndo failed: unable to parse target pose(s).");
+        return;
+    }
+
+    pathUndoRewrittenLines = new List<string>();
+    for (int i = 0; i < lines.Count; i++)
+        if (!removeIdx.Contains(i))
+            pathUndoRewrittenLines.Add(lines[i]);
+
+    BeginUndoNavigation(PathUndoMode.PathPoints);
+    Echo($"PathRecordUndo started. Reversing through {pathUndoTargetsPos.Count} point(s).");
+}
+
+void StartPathRecordMineUndo()
+{
+    if (pathUndoMode != PathUndoMode.None)
+    {
+        Echo("Undo already in progress.");
+        return;
+    }
+    if (pathRecordMineStage != PathRecordMineStage.Idle || pathRecordingWaitReturn)
+    {
+        Echo("Finish current pathrecordmine sequence before mine undo.");
+        return;
+    }
+
+    IMyTimerBlock timer = FindPathTimer();
+    if (timer == null)
+    {
+        Echo($"PathRecordMineUndo failed: timer tag '{pathTimerTag}' not found.");
+        return;
+    }
+
+    List<string> lines = SplitPathTimerLines(timer.CustomData);
+    int mineIdx = -1;
+    for (int i = lines.Count - 1; i >= 0; i--)
+    {
+        if (IsMineAreaRecordLine(lines[i]))
+        {
+            mineIdx = i;
+            break;
+        }
+    }
+    if (mineIdx < 0)
+    {
+        Echo("PathRecordMineUndo failed: no minearea record found.");
+        return;
+    }
+
+    Vector3D minePose, mineForward, mineUp;
+    if (!TryParseMineUndoPose(lines[mineIdx], out minePose, out mineForward, out mineUp))
+    {
+        Echo("PathRecordMineUndo failed: could not parse last minearea pose.");
+        return;
+    }
+
+    double dist = Vector3D.Distance(rc.GetPosition(), minePose);
+    if (dist > 50.0)
+    {
+        Echo($"PathRecordMineUndo denied: {dist:0.0}m from last mine pose (max 50.0m).");
+        return;
+    }
+
+    pathUndoTargetsPos.Clear();
+    pathUndoTargetsForward.Clear();
+    pathUndoTargetsUp.Clear();
+    HashSet<int> removablePostMinePathIndexes = new HashSet<int>();
+
+    // Reverse through any path points recorded after the minearea record, then end at mine pose.
+    for (int i = lines.Count - 1; i > mineIdx; i--)
+    {
+        if (!IsPathPoseRecordLine(lines[i]))
+            continue;
+        Vector3D p, f, u;
+        if (TryParsePoseRecordLine(lines[i], out p, out f, out u))
+        {
+            removablePostMinePathIndexes.Add(i); // only remove points that were actually queued for reverse travel
+            pathUndoTargetsPos.Add(p);
+            pathUndoTargetsForward.Add(f);
+            pathUndoTargetsUp.Add(u);
+        }
+    }
+    pathUndoTargetsPos.Add(minePose);
+    pathUndoTargetsForward.Add(mineForward);
+    pathUndoTargetsUp.Add(mineUp);
+
+    pathUndoRewrittenLines = new List<string>();
+    for (int i = 0; i < lines.Count; i++)
+    {
+        if (i == mineIdx)
+            continue; // remove the minearea record itself
+        if (removablePostMinePathIndexes.Contains(i))
+            continue; // remove path points recorded after that minearea record
+        pathUndoRewrittenLines.Add(lines[i]);
+    }
+
+    BeginUndoNavigation(PathUndoMode.MineRecord);
+    Echo($"PathRecordMineUndo started. Reversing {Math.Max(0, pathUndoTargetsPos.Count - 1)} point(s), then returning to mine pose.");
+}
+
+void BeginUndoNavigation(PathUndoMode mode)
+{
+    pathUndoMode = mode;
+    pathUndoTargetIndex = 0;
+    pathRecordingEnabled = true;
+    pathRecordingPaused = true;
+    pathRecordingWaitReturn = false;
+    miningEnabled = false;
+    miningState = MiningState.Idle;
+    SetDrills(false);
+    ApplyUndoTarget();
+}
+
+bool UpdatePathUndoState()
+{
+    if (pathUndoMode == PathUndoMode.None || pathUndoTargetsPos.Count == 0)
+        return false;
+
+    if (IsAtTargetPose(pathUndoTargetsPos[pathUndoTargetIndex], pathUndoTargetsForward[pathUndoTargetIndex], pathUndoTargetsUp[pathUndoTargetIndex], miningArrivalTolerance))
+    {
+        pathUndoTargetIndex++;
+        if (pathUndoTargetIndex >= pathUndoTargetsPos.Count)
+        {
+            FinalizePathUndo();
+            return false;
+        }
+        ApplyUndoTarget();
+    }
+    else
+    {
+        ApplyUndoTarget();
+    }
+    return false;
+}
+
+void ApplyUndoTarget()
+{
+    targetPosition = pathUndoTargetsPos[pathUndoTargetIndex];
+    desiredForward = pathUndoTargetsForward[pathUndoTargetIndex];
+    desiredUp = pathUndoTargetsUp[pathUndoTargetIndex];
+    hasTarget = true;
+    autopilotEnabled = true;
+    activeMaxSpeed = SPEEDB;
+}
+
+void FinalizePathUndo()
+{
+    PathUndoMode completedMode = pathUndoMode;
+
+    IMyTimerBlock timer = FindPathTimer();
+    if (timer != null)
+        timer.CustomData = JoinPathTimerLines(pathUndoRewrittenLines);
+
+    RecountPathRecordCounters(pathUndoRewrittenLines);
+    pathUndoMode = PathUndoMode.None;
+    pathUndoTargetsPos.Clear();
+    pathUndoTargetsForward.Clear();
+    pathUndoTargetsUp.Clear();
+    pathUndoRewrittenLines.Clear();
+    pathUndoTargetIndex = 0;
+
+    autopilotEnabled = false;
+    hasTarget = false;
+    activeMaxSpeed = 0;
+    pathRecordingEnabled = true;
+    pathRecordingWaitReturn = false;
+    pathRecordMineStage = PathRecordMineStage.Idle;
+    pathRecordLastPos = rc.GetPosition();
+    SetCockpitGyroControl(true);
+    ResetMovement();
+
+    if (completedMode == PathUndoMode.PathPoints)
+    {
+        pathRecordingPaused = false;
+        Echo("Undo complete. Path recording resumed.");
+    }
+    else
+    {
+        pathRecordingPaused = true;
+        Echo("Mine undo complete. Holding at mine pose.");
+    }
 }
 
 void HandlePathRecordMineStep()
@@ -914,6 +1202,125 @@ bool AppendPathRecordLine(string line)
     if (!string.IsNullOrWhiteSpace(existing) && !existing.EndsWith("\n"))
         existing += "\n";
     timer.CustomData = existing + line + "\n";
+    return true;
+}
+
+List<string> SplitPathTimerLines(string data)
+{
+    if (string.IsNullOrWhiteSpace(data))
+        return new List<string>();
+    string[] split = data.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+    List<string> result = new List<string>(split.Length);
+    foreach (string s in split)
+    {
+        string t = s.Trim();
+        if (!string.IsNullOrWhiteSpace(t))
+            result.Add(t);
+    }
+    return result;
+}
+
+string JoinPathTimerLines(List<string> lines)
+{
+    if (lines == null || lines.Count == 0)
+        return "";
+    return string.Join("\n", lines) + "\n";
+}
+
+void RecountPathRecordCounters(List<string> lines)
+{
+    int gpsCount = 0;
+    int mineCount = 0;
+    foreach (string raw in lines)
+    {
+        if (IsMineAreaRecordLine(raw))
+            mineCount++;
+        else if (IsPathPoseRecordLine(raw))
+            gpsCount++;
+    }
+    pathRecordCounter = gpsCount;
+    pathRecordMineCounter = mineCount;
+}
+
+bool IsPathPoseRecordLine(string line)
+{
+    if (string.IsNullOrWhiteSpace(line))
+        return false;
+    string t = line.Trim();
+    return t.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase) && t.IndexOf(":|", StringComparison.Ordinal) >= 0;
+}
+
+bool IsMineAreaRecordLine(string line)
+{
+    if (string.IsNullOrWhiteSpace(line))
+        return false;
+    return line.Trim().StartsWith("GPS:Corner A", StringComparison.OrdinalIgnoreCase);
+}
+
+bool TryParsePoseRecordLine(string line, out Vector3D pos, out Vector3D forward, out Vector3D up)
+{
+    pos = Vector3D.Zero;
+    forward = Vector3D.Zero;
+    up = Vector3D.Zero;
+    if (string.IsNullOrWhiteSpace(line))
+        return false;
+    string t = line.Trim();
+    int sep = t.IndexOf("|", StringComparison.Ordinal);
+    if (sep < 0)
+        return false;
+    string gpsPart = t.Substring(0, sep);
+    string orientPart = t.Substring(sep + 1);
+
+    if (!TryParsePoint(gpsPart, out pos))
+        return false;
+    if (string.IsNullOrWhiteSpace(orientPart))
+        return false;
+
+    string[] c = orientPart.Split(',');
+    if (c.Length != 6)
+        return false;
+    double ux, uy, uz, fx, fy, fz;
+    if (!double.TryParse(c[0], out ux) || !double.TryParse(c[1], out uy) || !double.TryParse(c[2], out uz) ||
+        !double.TryParse(c[3], out fx) || !double.TryParse(c[4], out fy) || !double.TryParse(c[5], out fz))
+        return false;
+
+    up = new Vector3D(ux, uy, uz);
+    forward = new Vector3D(fx, fy, fz);
+    if (up.LengthSquared() < 0.001 || forward.LengthSquared() < 0.001)
+        return false;
+    up = Vector3D.Normalize(up);
+    forward = Vector3D.Normalize(forward);
+    return true;
+}
+
+bool TryParseMineUndoPose(string mineLine, out Vector3D pos, out Vector3D forward, out Vector3D up)
+{
+    pos = Vector3D.Zero;
+    forward = Vector3D.Zero;
+    up = Vector3D.Zero;
+    if (string.IsNullOrWhiteSpace(mineLine))
+        return false;
+
+    string[] parts = mineLine.Split(';');
+    if (parts.Length < 3)
+        return false;
+    if (!TryParsePoint(parts[0], out pos))
+        return false; // use corner A as the mine pose anchor
+
+    string[] c = parts[2].Split(',');
+    if (c.Length != 6)
+        return false;
+    double ux, uy, uz, fx, fy, fz;
+    if (!double.TryParse(c[0], out ux) || !double.TryParse(c[1], out uy) || !double.TryParse(c[2], out uz) ||
+        !double.TryParse(c[3], out fx) || !double.TryParse(c[4], out fy) || !double.TryParse(c[5], out fz))
+        return false;
+
+    up = new Vector3D(ux, uy, uz);
+    forward = new Vector3D(fx, fy, fz);
+    if (up.LengthSquared() < 0.001 || forward.LengthSquared() < 0.001)
+        return false;
+    up = Vector3D.Normalize(up);
+    forward = Vector3D.Normalize(forward);
     return true;
 }
 
@@ -1169,8 +1576,8 @@ bool RefreshDockHardware()
 
 void RecompileFlightSystems()
 {
-    allGyros = GetBlocks<IMyGyro>();
-    allThrusters = GetBlocks<IMyThrust>();
+    allGyros = GetBlocks<IMyGyro>().FindAll(b => HasMinerTag(b));
+    allThrusters = GetBlocks<IMyThrust>().FindAll(b => HasMinerTag(b));
     thrust = new ThrusterControl(rc, tickSpeed, allThrusters);
     gyros = new GyroControl(rc, tickSpeed, allGyros);
 }
