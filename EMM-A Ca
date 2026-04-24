@@ -53,6 +53,8 @@ string asteroidHeaderLine = "---------------------------------------------------
 double goToLeadDistanceMeters = 1000;
 double goToBubbleOffsetMeters = 150;
 double goToBubbleRadiusMeters = 750;
+double mineStationarySpeedMps = 0.20;
+int mineStationaryConfirmTicks = 30;
 // =============================================
 
 IMyShipController rc;
@@ -89,6 +91,7 @@ enum MineSequenceState
 {
     None,
     GoingTo,
+    WaitingForStationary,
     WaitingMinerPathComplete,
     ReturningToFrontApproach
 }
@@ -100,6 +103,7 @@ Vector3D mineSavedForward = Vector3D.Zero;
 Vector3D mineSavedUp = Vector3D.Zero;
 Vector3D mineFrontApproachPoint = Vector3D.Zero;
 bool minerPathCompleteReceived = false;
+int mineStationaryTicks = 0;
 
 public Program()
 {
@@ -349,6 +353,7 @@ void RemoteCommand(string command)
             mineSequenceState   = MineSequenceState.None;
             mineAsteroidNum     = 0;
             minerPathCompleteReceived = false;
+            mineStationaryTicks = 0;
             pathMode            = false;
             pathPaused          = false;
             pathPausedNavResume = false;
@@ -485,6 +490,7 @@ void StartMineSequence(string argument)
     mineSavedUp = savedUp;
     mineFrontApproachPoint = savedPos + savedForward * goToLeadDistanceMeters;
     minerPathCompleteReceived = false;
+    mineStationaryTicks = 0;
 
     HandleGoTo("GoTo " + asteroidNum.ToString("D3"));
     if (!goToMode)
@@ -507,9 +513,27 @@ void UpdateMineSequence()
         if (goToMode)
             return;
 
+        mineSequenceState = MineSequenceState.WaitingForStationary;
+        mineStationaryTicks = 0;
+        Echo($"Mine: GoTo complete. Waiting to be stationary before starting miner for asteroid {mineAsteroidNum:D3}.");
+        return;
+    }
+
+    if (mineSequenceState == MineSequenceState.WaitingForStationary)
+    {
+        double speed = rc.GetShipVelocities().LinearVelocity.Length();
+        if (speed <= Math.Max(0, mineStationarySpeedMps))
+            mineStationaryTicks++;
+        else
+            mineStationaryTicks = 0;
+
+        if (mineStationaryTicks < Math.Max(1, mineStationaryConfirmTicks))
+            return;
+
         LoadAsteroid("LoadAsteroid " + mineAsteroidNum.ToString("D3"));
         SendMinerCommand("PathStart");
         mineSequenceState = MineSequenceState.WaitingMinerPathComplete;
+        mineStationaryTicks = 0;
         Echo($"Mine: waiting for miner completion broadcast for asteroid {mineAsteroidNum:D3}.");
         return;
     }
@@ -541,6 +565,7 @@ void UpdateMineSequence()
         mineSequenceState = MineSequenceState.None;
         mineAsteroidNum = 0;
         minerPathCompleteReceived = false;
+        mineStationaryTicks = 0;
         Echo("Mine: sequence complete.");
     }
 }
@@ -1331,6 +1356,7 @@ void SaveState()
     sb.AppendLine("mineSavedUp=" + V3ToString(mineSavedUp));
     sb.AppendLine("mineFrontApproachPoint=" + V3ToString(mineFrontApproachPoint));
     sb.AppendLine("minerPathCompleteReceived=" + (minerPathCompleteReceived ? "1" : "0"));
+    sb.AppendLine("mineStationaryTicks=" + mineStationaryTicks);
     Storage = sb.ToString();
 }
 
@@ -1380,6 +1406,7 @@ void LoadState()
     if (dict.TryGetValue("mineSavedUp", out s) && TryParseV3(s, out v)) mineSavedUp = v;
     if (dict.TryGetValue("mineFrontApproachPoint", out s) && TryParseV3(s, out v)) mineFrontApproachPoint = v;
     if (dict.TryGetValue("minerPathCompleteReceived", out s)) minerPathCompleteReceived = s == "1";
+    if (dict.TryGetValue("mineStationaryTicks", out s) && int.TryParse(s, out n)) mineStationaryTicks = n;
 }
 
 // ---- Parse helpers ----
