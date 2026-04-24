@@ -6,7 +6,7 @@
 // Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward  : auto-derive up/forward toward target
 // stop         : disable autopilot and release controls
 // start        : enable autopilot (requires a target)
-// clear        : clear target and all path state
+// reset        : clear target and all path state
 // dumpgps      : save current GPS + orientation to Custom Data
 // pathstart    : load records from "Carrier Path" timer and execute row-by-row
 // pathpause    : pause path execution
@@ -310,6 +310,7 @@ void RemoteCommand(string command)
             WriteEcho();
             break;
         case "clear":
+        case "reset":
             hasTarget           = false;
             desiredForward      = Vector3D.Zero;
             desiredUp           = Vector3D.Zero;
