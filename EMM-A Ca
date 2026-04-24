@@ -16,8 +16,9 @@
 // TOFFRESET    : reset target offset to 0,0,0
 // saveasteroid : simulate recompile, then save carrier pos, miner ore totals, and miner
 //                path into the next Asteroid Record slot across "EMM-A Ca Asteroid DB Axx"
-//                timers (asteroidsPerDb records each). Also updates "EMM-A Ca Zone DB".
-//                Sends PathClear to the miner after saving.
+//                timers (asteroidsPerDb records each). Also updates "EMM-A Ca Zone DB"
+//                with ore list + status (saved as Complete). Sends PathClear to miner.
+// setallopen   : set all asteroid status lines in Zone DB to "Open" (adds missing lines).
 // LoadAsteroid <n> : load the path records from the saved Asteroid record <n> (e.g. 002)
 //                    into the miner's "EMM-A Mi Path" timer, replacing its current content.
 // GoTo <n>         : approach saved Asteroid <n> from a safe side-point, then fly/align to saved
@@ -376,6 +377,9 @@ void RemoteCommand(string command)
         case "saveasteroid":
             SaveAsteroid();
             break;
+        case "setallopen":
+            SetAllAsteroidsOpen();
+            break;
     }
 }
 
@@ -600,8 +604,8 @@ void SaveAsteroid()
         existingDb += "\n";
     dbTimer.CustomData = existingDb + sb.ToString();
 
-    // Update the Zone DB
-    UpdateZoneDb(asteroidNum, dbTimerName, carrierGps);
+    // Update the Zone DB (GPS + ore summary + mined status)
+    UpdateZoneDb(asteroidNum, dbTimerName, carrierGps, oreMap);
 
     Echo($"SaveAsteroid: Asteroid {label} saved. Zone DB updated.");
     SendMinerCommand("PathClear");
@@ -1007,7 +1011,12 @@ List<string> ExtractAsteroidPathLines(string dbContent, int asteroidNum)
 
 // Appends one asteroid entry to the Zone DB timer.
 // A new section header (DB timer name) is inserted whenever a new DB block starts.
-void UpdateZoneDb(int asteroidNum, string dbTimerName, string carrierGps)
+// Entry layout:
+//   001
+//   GPS:Carrier:...
+//   Ores: Ice,Iron,Nickel
+//   Status: Complete
+void UpdateZoneDb(int asteroidNum, string dbTimerName, string carrierGps, Dictionary<string, double> oreMap)
 {
     IMyTimerBlock zoneDb = FindZoneDbTimer();
     if (zoneDb == null)
@@ -1033,8 +1042,108 @@ void UpdateZoneDb(int asteroidNum, string dbTimerName, string carrierGps)
 
     sb.AppendLine(asteroidNum.ToString("D3"));
     sb.AppendLine(carrierGps);
+    sb.AppendLine("Ores: " + BuildOreSummary(oreMap));
+    sb.AppendLine("Status: " + BuildAsteroidStatus(oreMap));
 
     zoneDb.CustomData = sb.ToString();
+}
+
+
+string BuildOreSummary(Dictionary<string, double> oreMap)
+{
+    if (oreMap == null || oreMap.Count == 0)
+        return "(none)";
+
+    var oreNames = new List<string>(oreMap.Keys);
+    oreNames.Sort(StringComparer.OrdinalIgnoreCase);
+    return string.Join(",", oreNames);
+}
+
+string BuildAsteroidStatus(Dictionary<string, double> _oreMap)
+{
+    return "Complete";
+}
+
+
+
+void SetAllAsteroidsOpen()
+{
+    IMyTimerBlock zoneDb = FindZoneDbTimer();
+    if (zoneDb == null)
+    {
+        Echo($"SetAllOpen: Zone DB timer '{zoneDbTimerTag}' not found.");
+        return;
+    }
+
+    var lines = new List<string>((zoneDb.CustomData ?? "").Split('\n'));
+    int updated = 0;
+    int added = 0;
+
+    // First, normalize any existing status lines.
+    for (int i = 0; i < lines.Count; i++)
+    {
+        string t = lines[i].Trim();
+        if (t.StartsWith("Status:", StringComparison.OrdinalIgnoreCase))
+        {
+            lines[i] = "Status: Open";
+            updated++;
+        }
+    }
+
+    // Then ensure every asteroid entry has a status line.
+    for (int i = 0; i < lines.Count; i++)
+    {
+        int asteroidNum;
+        if (!IsAsteroidLabelLine(lines[i].Trim(), out asteroidNum))
+            continue;
+
+        int gpsIdx = -1;
+        int oresIdx = -1;
+        int statusIdx = -1;
+
+        for (int j = i + 1; j < lines.Count; j++)
+        {
+            string t = lines[j].Trim();
+            if (string.IsNullOrWhiteSpace(t))
+                continue;
+
+            int nextNum;
+            if (IsAsteroidLabelLine(t, out nextNum) ||
+                t.IndexOf(asteroidDbTagPfx, StringComparison.OrdinalIgnoreCase) >= 0)
+                break;
+
+            if (gpsIdx < 0 && t.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+                gpsIdx = j;
+            else if (t.StartsWith("Ores:", StringComparison.OrdinalIgnoreCase))
+                oresIdx = j;
+            else if (t.StartsWith("Status:", StringComparison.OrdinalIgnoreCase))
+            {
+                statusIdx = j;
+                break;
+            }
+        }
+
+        if (statusIdx >= 0)
+            continue;
+
+        int insertAt = oresIdx >= 0 ? oresIdx + 1 : (gpsIdx >= 0 ? gpsIdx + 1 : i + 1);
+        lines.Insert(insertAt, "Status: Open");
+        added++;
+        i = insertAt;
+    }
+
+    zoneDb.CustomData = string.Join("\n", lines).TrimEnd();
+    Echo($"SetAllOpen: status set to Open (updated {updated}, added {added}).");
+}
+
+bool IsAsteroidLabelLine(string line, out int asteroidNum)
+{
+    asteroidNum = 0;
+    if (string.IsNullOrWhiteSpace(line))
+        return false;
+    if (line.Length != 3)
+        return false;
+    return int.TryParse(line, out asteroidNum);
 }
 
 // ---- State persistence ----
