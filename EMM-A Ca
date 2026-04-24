@@ -504,7 +504,7 @@ void UpdateMineSequence()
 
     if (mineSequenceState == MineSequenceState.GoingTo)
     {
-        if (goToMode || autopilotEnabled || hasTarget)
+        if (goToMode)
             return;
 
         LoadAsteroid("LoadAsteroid " + mineAsteroidNum.ToString("D3"));
