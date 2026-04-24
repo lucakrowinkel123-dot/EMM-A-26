@@ -115,6 +115,10 @@ bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
 bool retryCurrentLane = false;
+bool returnToMinePoseAfterArea = false;
+Vector3D areaMineEntryPos = Vector3D.Zero;
+Vector3D areaMineEntryForward = Vector3D.Zero;
+Vector3D areaMineEntryUp = Vector3D.Zero;
 bool pathMode = false;
 bool pathPaused = false;
 bool pathPausedNavResume = false;
@@ -538,6 +542,7 @@ void RemoteCommand (string command)
             areaLaneIndex = 0;
             retryCurrentLane = false;
             stuckRetryCount = 0;
+            returnToMinePoseAfterArea = false;
             pathMode = false;
             pathPaused = false;
             pathPausedNavResume = false;
@@ -567,6 +572,7 @@ void RemoteCommand (string command)
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
             retryCurrentLane = false;
+            returnToMinePoseAfterArea = false;
             activeMaxSpeed = 0;
             SetDrills(false);
             Echo("Mining cancelled.");
@@ -1749,6 +1755,10 @@ void StartAreaMining(string command)
     drillAxis = forward;
     desiredUp = up;
     desiredForward = drillAxis;
+    areaMineEntryPos = rc.GetPosition();
+    areaMineEntryForward = Vector3D.Normalize(rc.WorldMatrix.Forward);
+    areaMineEntryUp = Vector3D.Normalize(rc.WorldMatrix.Up);
+    returnToMinePoseAfterArea = true;
 
     areaMiningMode = true;
     areaLaneIndex = 0;
@@ -2131,6 +2141,17 @@ void FinishAreaMining()
         pathRecordMineStage = PathRecordMineStage.ReturningToEntry;
         Echo("Mining complete. Returning to mine pose...");
     }
+    else if (returnToMinePoseAfterArea)
+    {
+        targetPosition = areaMineEntryPos;
+        desiredUp = areaMineEntryUp;
+        desiredForward = areaMineEntryForward;
+        hasTarget = true;
+        autopilotEnabled = true;
+        activeMaxSpeed = SPEEDB;
+        returnToMinePoseAfterArea = false;
+        Echo("Mining complete. Returning to mine pose...");
+    }
     else
     {
         autopilotEnabled = false;
@@ -2266,6 +2287,10 @@ void SaveState()
     sb.AppendLine("depthMode=" + (int)depthMode);
     sb.AppendLine("areaMiningMode=" + (areaMiningMode ? "1" : "0"));
     sb.AppendLine("areaLaneIndex=" + areaLaneIndex);
+    sb.AppendLine("returnToMinePoseAfterArea=" + (returnToMinePoseAfterArea ? "1" : "0"));
+    sb.AppendLine("areaMineEntryPos=" + V3ToString(areaMineEntryPos));
+    sb.AppendLine("areaMineEntryForward=" + V3ToString(areaMineEntryForward));
+    sb.AppendLine("areaMineEntryUp=" + V3ToString(areaMineEntryUp));
     sb.AppendLine("retryLane=" + (retryCurrentLane ? "1" : "0"));
     sb.AppendLine("stuckBackout=" + (stuckBackout ? "1" : "0"));
     sb.AppendLine("stuckRetryCount=" + stuckRetryCount);
@@ -2338,6 +2363,10 @@ void LoadState()
     if (dict.TryGetValue("depthMode", out s) && int.TryParse(s, out n)) depthMode = (DepthMode)n;
     if (dict.TryGetValue("areaMiningMode", out s)) areaMiningMode = s == "1";
     if (dict.TryGetValue("areaLaneIndex", out s) && int.TryParse(s, out n)) areaLaneIndex = n;
+    if (dict.TryGetValue("returnToMinePoseAfterArea", out s)) returnToMinePoseAfterArea = s == "1";
+    if (dict.TryGetValue("areaMineEntryPos", out s) && TryParseV3(s, out v)) areaMineEntryPos = v;
+    if (dict.TryGetValue("areaMineEntryForward", out s) && TryParseV3(s, out v)) areaMineEntryForward = v;
+    if (dict.TryGetValue("areaMineEntryUp", out s) && TryParseV3(s, out v)) areaMineEntryUp = v;
     if (dict.TryGetValue("retryLane", out s)) retryCurrentLane = s == "1";
     if (dict.TryGetValue("stuckBackout", out s)) stuckBackout = s == "1";
     if (dict.TryGetValue("stuckRetryCount", out s) && int.TryParse(s, out n)) stuckRetryCount = n;
