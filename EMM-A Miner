@@ -870,6 +870,7 @@ void HandlePathRecordMineStep()
     {
         pathRecordMineCornerA = rc.GetPosition();
         pathRecordMineStage = PathRecordMineStage.CornerCaptured;
+        TriggerPathPointFlash();
         Echo("Mine step 2/3 saved. Soft lock active (right/down only).");
         return;
     }
@@ -883,6 +884,7 @@ void HandlePathRecordMineStep()
         Echo($"Mine area record ready but timer tag '{pathTimerTag}' not found.");
         return;
     }
+    TriggerPathPointFlash();
 
     targetPosition = pathRecordMineEntry;
     desiredUp = pathRecordMineUp;
