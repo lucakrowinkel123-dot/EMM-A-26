@@ -25,9 +25,6 @@
 //                    carrier pose while avoiding the asteroid bubble around the saved site.
 // Mine <n>         : orchestrates GoTo <n> -> LoadAsteroid <n> -> miner PathStart -> wait for miner
 //                    path completion broadcast -> move to front approach point and finish.
-// fullauto         : repeatedly choose closest ore-matching asteroid from Zone DB and run Mine <n>.
-//                    Candidate path from current position to site must stay >= 750m from other saved asteroid poses.
-// fullautostop     : stop the fullauto loop (and current in-progress Mine sequence).
 // =====================================
 
 // ========== Editable Script Settings ==========
@@ -50,14 +47,12 @@ int    asteroidsPerDb    = 5;                      // how many Asteroid Records 
 string minerPathTimerTag = "EMM-A Mi Path";        // name tag of the miner's Path timer
 string asteroidDbTagPfx  = "EMM-A Ca Asteroid DB "; // prefix for Asteroid DB timer names
 string zoneDbTimerTag    = "EMM-A Ca Zone DB";     // exact name of the Zone DB timer
-string oreFlagsTimerName = "EMM-A Ca Ores";       // timer CustomData stores ore on/off flags
 string minerContainerTag = "EMM-A Mi ";            // name tag for miner cargo containers
 string minerPbTag        = "EMM-A Mi Prog. Block (Miner)";          // name tag for the miner's programmable block
 string asteroidHeaderLine = "------------------------------------------------------------------------------------------------";
 double goToLeadDistanceMeters = 1000;
 double goToBubbleOffsetMeters = 150;
 double goToBubbleRadiusMeters = 750;
-double fullAutoPathClearanceMeters = 750;
 double mineStationarySpeedMps = 0.20;
 int mineStationaryConfirmTicks = 30;
 string indicatorLightName = "EMM-A Ca Indicator light";
@@ -117,9 +112,6 @@ Vector3D mineSavedUp = Vector3D.Zero;
 Vector3D mineFrontApproachPoint = Vector3D.Zero;
 bool minerPathCompleteReceived = false;
 int mineStationaryTicks = 0;
-bool fullAutoEnabled = false;
-int fullAutoLastAsteroidNum = 0;
-List<int> fullAutoVisitedAsteroids = new List<int>();
 
 public Program()
 {
@@ -177,7 +169,6 @@ public void Main(string argument, UpdateType updateSource)
 
         UpdateGoToRunner();
         UpdateMineSequence();
-        UpdateFullAutoRunner();
         UpdatePathRunner();
         UpdateIndicatorLight();
         runtime++;
@@ -304,8 +295,6 @@ void WriteEcho()
         sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
     if (mineSequenceState != MineSequenceState.None)
         sb.AppendLine($"Mine: {mineSequenceState} ({mineAsteroidNum:D3})");
-    if (fullAutoEnabled)
-        sb.AppendLine("FullAuto: Enabled" + (fullAutoLastAsteroidNum > 0 ? $" (last {fullAutoLastAsteroidNum:D3})" : ""));
     sb.AppendLine($"Connector: {(carrierConnector != null ? carrierConnector.CustomName : "<missing>")}");
     sb.AppendLine("Dock broadcast: " + dockBroadcastTag);
     Echo(sb.ToString());
@@ -454,9 +443,6 @@ void RemoteCommand(string command)
             mineAsteroidNum     = 0;
             minerPathCompleteReceived = false;
             mineStationaryTicks = 0;
-            fullAutoEnabled      = false;
-            fullAutoLastAsteroidNum = 0;
-            fullAutoVisitedAsteroids.Clear();
             pathMode            = false;
             pathPaused          = false;
             pathPausedNavResume = false;
@@ -521,12 +507,6 @@ void RemoteCommand(string command)
             break;
         case "setallopen":
             SetAllAsteroidsOpen();
-            break;
-        case "fullauto":
-            StartFullAuto();
-            break;
-        case "fullautostop":
-            StopFullAuto(true);
             break;
     }
 }
@@ -671,281 +651,12 @@ void UpdateMineSequence()
         autopilotEnabled = false;
         hasTarget = false;
         activeMaxSpeed = 0;
-        if (fullAutoEnabled && mineAsteroidNum > 0 && !fullAutoVisitedAsteroids.Contains(mineAsteroidNum))
-            fullAutoVisitedAsteroids.Add(mineAsteroidNum);
         mineSequenceState = MineSequenceState.None;
         mineAsteroidNum = 0;
         minerPathCompleteReceived = false;
         mineStationaryTicks = 0;
         Echo("Mine: sequence complete.");
     }
-}
-
-
-void StartFullAuto()
-{
-    fullAutoEnabled = true;
-    fullAutoVisitedAsteroids.Clear();
-    Echo("FullAuto: enabled.");
-}
-
-void StopFullAuto(bool stopActiveMine)
-{
-    fullAutoEnabled = false;
-    fullAutoLastAsteroidNum = 0;
-    fullAutoVisitedAsteroids.Clear();
-    if (stopActiveMine && mineSequenceState != MineSequenceState.None)
-    {
-        mineSequenceState = MineSequenceState.None;
-        mineAsteroidNum = 0;
-        minerPathCompleteReceived = false;
-        mineStationaryTicks = 0;
-        goToMode = false;
-        goToStage = 0;
-        autopilotEnabled = false;
-        hasTarget = false;
-        activeMaxSpeed = 0;
-        ResetMovement();
-        Echo("FullAuto: stopped (active Mine sequence aborted).");
-        return;
-    }
-
-    Echo("FullAuto: stopped.");
-}
-
-void UpdateFullAutoRunner()
-{
-    if (!fullAutoEnabled)
-        return;
-
-    if (mineSequenceState != MineSequenceState.None || goToMode || pathMode)
-        return;
-
-    int nextAsteroid;
-    string reason;
-    if (!TryPickFullAutoAsteroid(out nextAsteroid, out reason))
-    {
-        Echo("FullAuto: " + reason + " Stopping.");
-        fullAutoEnabled = false;
-        return;
-    }
-
-    fullAutoLastAsteroidNum = nextAsteroid;
-    StartMineSequence("Mine " + nextAsteroid.ToString("D3"));
-}
-
-bool TryPickFullAutoAsteroid(out int asteroidNum, out string reason)
-{
-    asteroidNum = 0;
-    reason = "no matching asteroids";
-
-    HashSet<string> enabledOres;
-    if (!TryLoadEnabledOreFlags(out enabledOres, out reason))
-        return false;
-
-    if (enabledOres.Count == 0)
-    {
-        reason = "no enabled ore flags in timer '" + oreFlagsTimerName + "'";
-        return false;
-    }
-
-    List<ZoneDbAsteroidRecord> records;
-    if (!TryLoadZoneDbRecords(out records, out reason))
-        return false;
-
-    Vector3D currentPos = rc.GetPosition();
-    double bestDistSq = double.MaxValue;
-    int bestNum = 0;
-
-    foreach (var record in records)
-    {
-        if (!record.HasPose || record.Ores.Count == 0)
-            continue;
-        if (fullAutoVisitedAsteroids.Contains(record.Number))
-            continue;
-
-        bool oreMatch = false;
-        foreach (var ore in record.Ores)
-        {
-            if (enabledOres.Contains(ore))
-            {
-                oreMatch = true;
-                break;
-            }
-        }
-        if (!oreMatch)
-            continue;
-
-        if (!IsFullAutoPathClear(currentPos, record.Position, record.Number, records))
-            continue;
-
-        double distSq = Vector3D.DistanceSquared(currentPos, record.Position);
-        if (distSq < bestDistSq)
-        {
-            bestDistSq = distSq;
-            bestNum = record.Number;
-        }
-    }
-
-    if (bestNum <= 0)
-    {
-        reason = "no ore-matching asteroid with a clear path";
-        return false;
-    }
-
-    asteroidNum = bestNum;
-    return true;
-}
-
-bool TryLoadEnabledOreFlags(out HashSet<string> enabledOres, out string reason)
-{
-    enabledOres = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    reason = "";
-
-    IMyTimerBlock oreTimer = FindOreFlagsTimer();
-    if (oreTimer == null)
-    {
-        reason = "ore flags timer '" + oreFlagsTimerName + "' not found";
-        return false;
-    }
-
-    string data = oreTimer.CustomData ?? "";
-    foreach (string raw in data.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
-    {
-        string line = raw.Trim();
-        if (line.Length == 0 || line.StartsWith("#"))
-            continue;
-
-        int eq = line.IndexOf('=');
-        if (eq < 0)
-            continue;
-
-        string ore = line.Substring(0, eq).Trim();
-        string flag = line.Substring(eq + 1).Trim();
-        if (ore.Length == 0)
-            continue;
-
-        bool on = flag == "1" ||
-                  flag.Equals("on", StringComparison.OrdinalIgnoreCase) ||
-                  flag.Equals("true", StringComparison.OrdinalIgnoreCase) ||
-                  flag.Equals("yes", StringComparison.OrdinalIgnoreCase);
-
-        if (on)
-            enabledOres.Add(ore);
-    }
-
-    return true;
-}
-
-IMyTimerBlock FindOreFlagsTimer()
-{
-    foreach (var t in GetBlocks<IMyTimerBlock>())
-    {
-        if (t == null || string.IsNullOrWhiteSpace(t.CustomName))
-            continue;
-        if (string.Equals(t.CustomName.Trim(), oreFlagsTimerName, StringComparison.OrdinalIgnoreCase))
-            return t;
-    }
-    return null;
-}
-
-class ZoneDbAsteroidRecord
-{
-    public int Number;
-    public Vector3D Position = Vector3D.Zero;
-    public bool HasPose = false;
-    public HashSet<string> Ores = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-}
-
-bool TryLoadZoneDbRecords(out List<ZoneDbAsteroidRecord> records, out string reason)
-{
-    records = new List<ZoneDbAsteroidRecord>();
-    reason = "";
-
-    IMyTimerBlock zoneDb = FindZoneDbTimer();
-    if (zoneDb == null)
-    {
-        reason = "zone DB timer '" + zoneDbTimerTag + "' not found";
-        return false;
-    }
-
-    string[] lines = (zoneDb.CustomData ?? "").Split(new[] { '\n', '\r' }, StringSplitOptions.None);
-    ZoneDbAsteroidRecord current = null;
-    foreach (string raw in lines)
-    {
-        string line = (raw ?? "").Trim();
-        if (line.Length == 0)
-            continue;
-
-        int asteroidNum;
-        if (IsAsteroidLabelLine(line, out asteroidNum))
-        {
-            current = new ZoneDbAsteroidRecord();
-            current.Number = asteroidNum;
-            records.Add(current);
-            continue;
-        }
-
-        if (current == null)
-            continue;
-
-        if (line.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
-        {
-            Vector3D pos, f, u;
-            if (TryParseGpsCommand(line, out pos, out f, out u))
-            {
-                current.Position = pos;
-                current.HasPose = true;
-            }
-        }
-        else if (line.StartsWith("Ores:", StringComparison.OrdinalIgnoreCase))
-        {
-            string csv = line.Substring(5).Trim();
-            foreach (string rawOre in csv.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                string ore = rawOre.Trim();
-                if (ore.Length == 0 || ore == "(none)")
-                    continue;
-                current.Ores.Add(ore);
-            }
-        }
-    }
-
-    if (records.Count == 0)
-    {
-        reason = "zone DB has no asteroid records";
-        return false;
-    }
-
-    return true;
-}
-
-bool IsFullAutoPathClear(Vector3D start, Vector3D end, int candidateAsteroidNum, List<ZoneDbAsteroidRecord> records)
-{
-    double minDistSq = fullAutoPathClearanceMeters * fullAutoPathClearanceMeters;
-    foreach (var record in records)
-    {
-        if (!record.HasPose || record.Number == candidateAsteroidNum)
-            continue;
-
-        double distSq = DistancePointToSegmentSquared(record.Position, start, end);
-        if (distSq < minDistSq)
-            return false;
-    }
-    return true;
-}
-
-double DistancePointToSegmentSquared(Vector3D point, Vector3D a, Vector3D b)
-{
-    Vector3D ab = b - a;
-    double abLenSq = ab.LengthSquared();
-    if (abLenSq < 1e-6)
-        return Vector3D.DistanceSquared(point, a);
-
-    double t = Vector3D.Dot(point - a, ab) / abLenSq;
-    t = MathHelper.Clamp(t, 0, 1);
-    Vector3D closest = a + ab * t;
-    return Vector3D.DistanceSquared(point, closest);
 }
 
 void StartPathFromTimer()
@@ -1735,11 +1446,6 @@ void SaveState()
     sb.AppendLine("mineFrontApproachPoint=" + V3ToString(mineFrontApproachPoint));
     sb.AppendLine("minerPathCompleteReceived=" + (minerPathCompleteReceived ? "1" : "0"));
     sb.AppendLine("mineStationaryTicks=" + mineStationaryTicks);
-    sb.AppendLine("fullAutoEnabled=" + (fullAutoEnabled ? "1" : "0"));
-    sb.AppendLine("fullAutoLastAsteroidNum=" + fullAutoLastAsteroidNum);
-    sb.AppendLine("fullAutoVisitedCount=" + fullAutoVisitedAsteroids.Count);
-    for (int i = 0; i < fullAutoVisitedAsteroids.Count; i++)
-        sb.AppendLine("fullAutoVisited" + i + "=" + fullAutoVisitedAsteroids[i]);
     Storage = sb.ToString();
 }
 
@@ -1790,18 +1496,6 @@ void LoadState()
     if (dict.TryGetValue("mineFrontApproachPoint", out s) && TryParseV3(s, out v)) mineFrontApproachPoint = v;
     if (dict.TryGetValue("minerPathCompleteReceived", out s)) minerPathCompleteReceived = s == "1";
     if (dict.TryGetValue("mineStationaryTicks", out s) && int.TryParse(s, out n)) mineStationaryTicks = n;
-    if (dict.TryGetValue("fullAutoEnabled", out s)) fullAutoEnabled = s == "1";
-    if (dict.TryGetValue("fullAutoLastAsteroidNum", out s) && int.TryParse(s, out n)) fullAutoLastAsteroidNum = n;
-    int fullAutoVisitedCount = 0;
-    if (dict.TryGetValue("fullAutoVisitedCount", out s) && int.TryParse(s, out fullAutoVisitedCount) && fullAutoVisitedCount > 0)
-    {
-        fullAutoVisitedAsteroids = new List<int>(fullAutoVisitedCount);
-        for (int i = 0; i < fullAutoVisitedCount; i++)
-        {
-            if (dict.TryGetValue("fullAutoVisited" + i, out s) && int.TryParse(s, out n) && n > 0)
-                fullAutoVisitedAsteroids.Add(n);
-        }
-    }
 }
 
 // ---- Parse helpers ----
