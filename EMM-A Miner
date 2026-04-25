@@ -5,7 +5,7 @@
 // Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward : auto derive up/forward vectors
 // stop : disables autopilot and releases controls
 // start : enables autopilot (if a target has been set)
-// clear : clears target and releases controls
+// reset : clears target and releases controls
 // dumpgps : appends current GPS + orientation snapshot to Custom Data
 // minelane;depth : run one mining lane from anchor to depth and return
 // minearea;<gps or x,y,z>;<gps or x,y,z>;Faceup,Faceforward;depth : run distributed lanes over rectangle
@@ -58,6 +58,10 @@ string carrierContainerTag = "EMM-A Ca ";
 bool dockUseMergerAssist = true;
 bool dockSyncMode = true;
 string dockBroadcastTag = "EMM_A_DOCK_POSE";
+string minerPathCompleteTag = "EMM_A_MINER_PATH_COMPLETE";
+string indicatorLightName = "EMM-A Mi Indicator light";
+double indicatorLightDelaySeconds = 0.5;
+double indicatorFlashGreenSeconds = 0.25;
 double dockPoseDistance = 50.0;
 double dockApproachSpeed = 15.0;
 double dockFinalSpeed = 15.0;
@@ -114,6 +118,10 @@ bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
 bool retryCurrentLane = false;
+bool returnToMinePoseAfterArea = false;
+Vector3D areaMineEntryPos = Vector3D.Zero;
+Vector3D areaMineEntryForward = Vector3D.Zero;
+Vector3D areaMineEntryUp = Vector3D.Zero;
 bool pathMode = false;
 bool pathPaused = false;
 bool pathPausedNavResume = false;
@@ -152,6 +160,7 @@ IMyShipConnector carrierConnector;
 IMyRemoteControl carrierRemote;
 IMyShipMergeBlock minerMerger;
 IMyShipMergeBlock carrierMerger;
+IMyLightingBlock indicatorLight;
 IMyBroadcastListener dockListener;
 List<IMyGyro> allGyros = new List<IMyGyro>();
 List<IMyThrust> allThrusters = new List<IMyThrust>();
@@ -196,6 +205,13 @@ List<MyInventoryItem> _invItems = new List<MyInventoryItem>();
 bool _invCached = false;
 // Cached path timer reference to avoid repeated GTS scans during path recording
 IMyTimerBlock _cachedPathTimer;
+int indicatorDelayTicksRemaining = 0;
+int indicatorFlashTicksRemaining = 0;
+enum IndicatorTransitionState { None, WaitEnableAfterColor, WaitNeutralAfterDisable }
+IndicatorTransitionState indicatorTransition = IndicatorTransitionState.None;
+readonly Color indicatorAutopilotColor = new Color(0, 200, 255);
+readonly Color indicatorFlashColor = new Color(0, 255, 0);
+readonly Color indicatorNeutralColor = Color.White;
 
 public Program ()
 {
@@ -221,6 +237,7 @@ public Program ()
     carrierRemote = GetBlock<IMyRemoteControl>(carrierRemoteName, true);
     minerMerger = GetBlock<IMyShipMergeBlock>(minerMergerName, true);
     carrierMerger = GetBlock<IMyShipMergeBlock>(carrierMergerName, true);
+    indicatorLight = GetBlock<IMyLightingBlock>(indicatorLightName, true);
     dockListener = IGC.RegisterBroadcastListener(dockBroadcastTag);
     dockListener.SetMessageCallback("dockpose");
     UpdateConnectorOffsetLocal();
@@ -268,6 +285,7 @@ public void Main (string argument, UpdateType updateSource)
         UpdatePathRunner();
         if (oreTransferActive)
             UpdateOreTransfer();
+        UpdateIndicatorLight();
         runtime++;
     }
     else
@@ -526,7 +544,7 @@ void RemoteCommand (string command)
             autopilotEnabled = true;
             WriteEcho();
             break;
-        case "clear":
+        case "reset":
             hasTarget = false;
             desiredForward = Vector3D.Zero;
             desiredUp = Vector3D.Zero;
@@ -537,6 +555,7 @@ void RemoteCommand (string command)
             areaLaneIndex = 0;
             retryCurrentLane = false;
             stuckRetryCount = 0;
+            returnToMinePoseAfterArea = false;
             pathMode = false;
             pathPaused = false;
             pathPausedNavResume = false;
@@ -566,6 +585,7 @@ void RemoteCommand (string command)
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
             retryCurrentLane = false;
+            returnToMinePoseAfterArea = false;
             activeMaxSpeed = 0;
             SetDrills(false);
             Echo("Mining cancelled.");
@@ -850,6 +870,7 @@ void HandlePathRecordMineStep()
     {
         pathRecordMineCornerA = rc.GetPosition();
         pathRecordMineStage = PathRecordMineStage.CornerCaptured;
+        TriggerPathPointFlash();
         Echo("Mine step 2/3 saved. Soft lock active (right/down only).");
         return;
     }
@@ -863,6 +884,7 @@ void HandlePathRecordMineStep()
         Echo($"Mine area record ready but timer tag '{pathTimerTag}' not found.");
         return;
     }
+    TriggerPathPointFlash();
 
     targetPosition = pathRecordMineEntry;
     desiredUp = pathRecordMineUp;
@@ -889,9 +911,106 @@ void SavePathGpsRecord()
     string idx = pathRecordCounter.ToString("000");
     string line = FormatCurrentGps(idx);
     if (AppendPathRecordLine(line))
+    {
+        TriggerPathPointFlash();
         Echo($"Path point saved: {idx}");
+    }
     else
         Echo($"Could not save path point {idx}; timer tag '{pathTimerTag}' not found.");
+}
+
+int GetIndicatorDelayTicks()
+{
+    return Math.Max(1, (int)Math.Ceiling(indicatorLightDelaySeconds / Math.Max(0.001, secondsPerTick)));
+}
+
+int GetFlashGreenTicks()
+{
+    return Math.Max(1, (int)Math.Ceiling(indicatorFlashGreenSeconds / Math.Max(0.001, secondsPerTick)));
+}
+
+void TriggerPathPointFlash()
+{
+    int minTicks = GetIndicatorDelayTicks() + GetFlashGreenTicks();
+    indicatorFlashTicksRemaining = Math.Max(indicatorFlashTicksRemaining, minTicks);
+}
+
+void UpdateIndicatorLight()
+{
+    if (indicatorLight == null)
+        indicatorLight = GetBlock<IMyLightingBlock>(indicatorLightName, true);
+    if (indicatorLight == null)
+        return;
+
+    bool flashGreen = indicatorFlashTicksRemaining > 0;
+    if (indicatorFlashTicksRemaining > 0)
+        indicatorFlashTicksRemaining--;
+
+    bool desiredOn = autopilotEnabled || flashGreen;
+    Color desiredOnColor = flashGreen ? indicatorFlashColor : indicatorAutopilotColor;
+
+    if (desiredOn)
+    {
+        if (indicatorTransition == IndicatorTransitionState.WaitNeutralAfterDisable)
+        {
+            indicatorTransition = IndicatorTransitionState.None;
+            indicatorDelayTicksRemaining = 0;
+        }
+
+        if (!indicatorLight.Enabled)
+        {
+            if (indicatorTransition != IndicatorTransitionState.WaitEnableAfterColor)
+            {
+                indicatorLight.Color = desiredOnColor; // set color first
+                indicatorDelayTicksRemaining = GetIndicatorDelayTicks();
+                indicatorTransition = IndicatorTransitionState.WaitEnableAfterColor;
+            }
+            else
+            {
+                indicatorLight.Color = desiredOnColor;
+                indicatorDelayTicksRemaining--;
+                if (indicatorDelayTicksRemaining <= 0)
+                {
+                    indicatorLight.Enabled = true; // enable after delay
+                    indicatorTransition = IndicatorTransitionState.None;
+                }
+            }
+        }
+        else
+        {
+            indicatorLight.Color = desiredOnColor;
+            indicatorTransition = IndicatorTransitionState.None;
+            indicatorDelayTicksRemaining = 0;
+        }
+        return;
+    }
+
+    if (indicatorTransition == IndicatorTransitionState.WaitEnableAfterColor)
+    {
+        indicatorTransition = IndicatorTransitionState.None;
+        indicatorDelayTicksRemaining = 0;
+    }
+
+    if (indicatorLight.Enabled)
+    {
+        indicatorLight.Enabled = false; // off first
+        indicatorDelayTicksRemaining = GetIndicatorDelayTicks();
+        indicatorTransition = IndicatorTransitionState.WaitNeutralAfterDisable;
+        return;
+    }
+
+    if (indicatorTransition == IndicatorTransitionState.WaitNeutralAfterDisable)
+    {
+        indicatorDelayTicksRemaining--;
+        if (indicatorDelayTicksRemaining <= 0)
+        {
+            indicatorLight.Color = indicatorNeutralColor; // neutral after delay while off
+            indicatorTransition = IndicatorTransitionState.None;
+        }
+        return;
+    }
+
+    indicatorLight.Color = indicatorNeutralColor;
 }
 
 string BuildMineAreaRecord(Vector3D cornerA, Vector3D cornerB, Vector3D up, Vector3D forward, double depth, int index)
@@ -1563,6 +1682,7 @@ void StartNextPathRecord()
     {
         pathMode = false;
         Echo("Path execution complete.");
+        IGC.SendBroadcastMessage(minerPathCompleteTag, "Path execution complete.");
     }
 }
 
@@ -1747,6 +1867,10 @@ void StartAreaMining(string command)
     drillAxis = forward;
     desiredUp = up;
     desiredForward = drillAxis;
+    areaMineEntryPos = rc.GetPosition();
+    areaMineEntryForward = Vector3D.Normalize(rc.WorldMatrix.Forward);
+    areaMineEntryUp = Vector3D.Normalize(rc.WorldMatrix.Up);
+    returnToMinePoseAfterArea = true;
 
     areaMiningMode = true;
     areaLaneIndex = 0;
@@ -1761,6 +1885,7 @@ void StartAreaMining(string command)
     miningState = MiningState.EnterLane;
     _invCached = false; // refresh inventory block list for ore tracking
     ResetDepthAutoTracker();
+    TriggerPathPointFlash();
 
     Echo($"Area mining started. Lanes={areaLaneAnchors.Count}, depth={laneDepth:0.00}m");
 }
@@ -2129,6 +2254,17 @@ void FinishAreaMining()
         pathRecordMineStage = PathRecordMineStage.ReturningToEntry;
         Echo("Mining complete. Returning to mine pose...");
     }
+    else if (returnToMinePoseAfterArea)
+    {
+        targetPosition = areaMineEntryPos;
+        desiredUp = areaMineEntryUp;
+        desiredForward = areaMineEntryForward;
+        hasTarget = true;
+        autopilotEnabled = true;
+        activeMaxSpeed = SPEEDB;
+        returnToMinePoseAfterArea = false;
+        Echo("Mining complete. Returning to mine pose...");
+    }
     else
     {
         autopilotEnabled = false;
@@ -2264,6 +2400,10 @@ void SaveState()
     sb.AppendLine("depthMode=" + (int)depthMode);
     sb.AppendLine("areaMiningMode=" + (areaMiningMode ? "1" : "0"));
     sb.AppendLine("areaLaneIndex=" + areaLaneIndex);
+    sb.AppendLine("returnToMinePoseAfterArea=" + (returnToMinePoseAfterArea ? "1" : "0"));
+    sb.AppendLine("areaMineEntryPos=" + V3ToString(areaMineEntryPos));
+    sb.AppendLine("areaMineEntryForward=" + V3ToString(areaMineEntryForward));
+    sb.AppendLine("areaMineEntryUp=" + V3ToString(areaMineEntryUp));
     sb.AppendLine("retryLane=" + (retryCurrentLane ? "1" : "0"));
     sb.AppendLine("stuckBackout=" + (stuckBackout ? "1" : "0"));
     sb.AppendLine("stuckRetryCount=" + stuckRetryCount);
@@ -2336,6 +2476,10 @@ void LoadState()
     if (dict.TryGetValue("depthMode", out s) && int.TryParse(s, out n)) depthMode = (DepthMode)n;
     if (dict.TryGetValue("areaMiningMode", out s)) areaMiningMode = s == "1";
     if (dict.TryGetValue("areaLaneIndex", out s) && int.TryParse(s, out n)) areaLaneIndex = n;
+    if (dict.TryGetValue("returnToMinePoseAfterArea", out s)) returnToMinePoseAfterArea = s == "1";
+    if (dict.TryGetValue("areaMineEntryPos", out s) && TryParseV3(s, out v)) areaMineEntryPos = v;
+    if (dict.TryGetValue("areaMineEntryForward", out s) && TryParseV3(s, out v)) areaMineEntryForward = v;
+    if (dict.TryGetValue("areaMineEntryUp", out s) && TryParseV3(s, out v)) areaMineEntryUp = v;
     if (dict.TryGetValue("retryLane", out s)) retryCurrentLane = s == "1";
     if (dict.TryGetValue("stuckBackout", out s)) stuckBackout = s == "1";
     if (dict.TryGetValue("stuckRetryCount", out s) && int.TryParse(s, out n)) stuckRetryCount = n;
