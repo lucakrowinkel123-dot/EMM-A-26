@@ -18,6 +18,8 @@
 //                path into the next Asteroid Record slot across "EMM-A Ca Asteroid DB Axx"
 //                timers (asteroidsPerDb records each). Also updates "EMM-A Ca Zone DB"
 //                with ore list + status (saved as Complete). Sends PathClear to miner.
+// Orename On/Off : enable or disable auto-adding missing ore names to timer "EMM-A Ca Ores"
+//                  custom data in format: <OreName> on
 // setallopen   : set all asteroid status lines in Zone DB to "Open" (adds missing lines).
 // LoadAsteroid <n> : load the path records from the saved Asteroid record <n> (e.g. 002)
 //                    into the miner's "EMM-A Mi Path" timer, replacing its current content.
@@ -47,9 +49,11 @@ int    asteroidsPerDb    = 5;                      // how many Asteroid Records 
 string minerPathTimerTag = "EMM-A Mi Path";        // name tag of the miner's Path timer
 string asteroidDbTagPfx  = "EMM-A Ca Asteroid DB "; // prefix for Asteroid DB timer names
 string zoneDbTimerTag    = "EMM-A Ca Zone DB";     // exact name of the Zone DB timer
+string oreNameTimerTag   = "EMM-A Ca Ores";        // exact name of timer storing ore on/off rows
 string minerContainerTag = "EMM-A Mi ";            // name tag for miner cargo containers
 string minerPbTag        = "EMM-A Mi Prog. Block (Miner)";          // name tag for the miner's programmable block
 string asteroidHeaderLine = "------------------------------------------------------------------------------------------------";
+bool oreNameAutoRecord = true; // if true, SaveAsteroid appends missing ore rows to oreNameTimerTag
 double goToLeadDistanceMeters = 1000;
 double goToBubbleOffsetMeters = 150;
 double goToBubbleRadiusMeters = 750;
@@ -416,6 +420,11 @@ void RemoteCommand(string command)
     if (trimmed.StartsWith("mine ", StringComparison.OrdinalIgnoreCase))
     {
         StartMineSequence(trimmed);
+        return;
+    }
+    if (trimmed.StartsWith("orename ", StringComparison.OrdinalIgnoreCase))
+    {
+        SetOreNameMode(trimmed);
         return;
     }
 
@@ -837,6 +846,7 @@ void SaveAsteroid()
 
     // Ore totals from miner containers
     var oreMap = CollectMinerOre();
+    EnsureOreNamesListed(oreMap);
 
     // Path lines from miner's Path timer
     List<string> pathLines = ReadMinerPathLines();
@@ -885,6 +895,81 @@ void SaveAsteroid()
 
     Echo($"SaveAsteroid: Asteroid {label} saved. Zone DB updated.");
     SendMinerCommand("PathClear");
+}
+
+void SetOreNameMode(string command)
+{
+    string[] parts = command.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length < 2)
+    {
+        Echo("Usage: Orename On|Off");
+        return;
+    }
+
+    string mode = parts[1].Trim();
+    if (mode.Equals("on", StringComparison.OrdinalIgnoreCase))
+    {
+        oreNameAutoRecord = true;
+        Echo("Orename is ON.");
+    }
+    else if (mode.Equals("off", StringComparison.OrdinalIgnoreCase))
+    {
+        oreNameAutoRecord = false;
+        Echo("Orename is OFF.");
+    }
+    else
+        Echo("Usage: Orename On|Off");
+}
+
+void EnsureOreNamesListed(Dictionary<string, double> oreMap)
+{
+    if (!oreNameAutoRecord || oreMap == null || oreMap.Count == 0)
+        return;
+
+    IMyTimerBlock oreTimer = GridTerminalSystem.GetBlockWithName(oreNameTimerTag) as IMyTimerBlock;
+    if (oreTimer == null)
+    {
+        Echo($"SaveAsteroid: ore timer '{oreNameTimerTag}' not found. Skipping Orename update.");
+        return;
+    }
+
+    string data = oreTimer.CustomData ?? "";
+    var knownOreNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (string rawLine in data.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
+    {
+        string line = rawLine.Trim();
+        if (line.Length == 0) continue;
+
+        string[] parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0) continue;
+        knownOreNames.Add(parts[0].Trim());
+    }
+
+    var missingOreNames = new List<string>();
+    foreach (string ore in oreMap.Keys)
+    {
+        if (!knownOreNames.Contains(ore))
+            missingOreNames.Add(ore);
+    }
+
+    if (missingOreNames.Count == 0)
+        return;
+
+    missingOreNames.Sort(StringComparer.OrdinalIgnoreCase);
+
+    var sb = new StringBuilder();
+    if (!string.IsNullOrWhiteSpace(data))
+    {
+        sb.Append(data);
+        if (!data.EndsWith("\n"))
+            sb.AppendLine();
+    }
+
+    foreach (string ore in missingOreNames)
+        sb.AppendLine(ore + " on");
+
+    oreTimer.CustomData = sb.ToString();
+    Echo($"SaveAsteroid: added {missingOreNames.Count} ore name(s) to '{oreNameTimerTag}'.");
 }
 
 // Refreshes all cached block references, mirroring a script recompile.
@@ -1559,6 +1644,7 @@ void SaveState()
     sb.AppendLine("mineFrontApproachPoint=" + V3ToString(mineFrontApproachPoint));
     sb.AppendLine("minerPathCompleteReceived=" + (minerPathCompleteReceived ? "1" : "0"));
     sb.AppendLine("mineStationaryTicks=" + mineStationaryTicks);
+    sb.AppendLine("oreNameAutoRecord=" + (oreNameAutoRecord ? "1" : "0"));
     Storage = sb.ToString();
 }
 
@@ -1609,6 +1695,7 @@ void LoadState()
     if (dict.TryGetValue("mineFrontApproachPoint", out s) && TryParseV3(s, out v)) mineFrontApproachPoint = v;
     if (dict.TryGetValue("minerPathCompleteReceived", out s)) minerPathCompleteReceived = s == "1";
     if (dict.TryGetValue("mineStationaryTicks", out s) && int.TryParse(s, out n)) mineStationaryTicks = n;
+    if (dict.TryGetValue("oreNameAutoRecord", out s)) oreNameAutoRecord = s == "1";
 }
 
 // ---- Parse helpers ----
