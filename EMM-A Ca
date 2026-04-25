@@ -561,6 +561,19 @@ void StartMineSequence(string argument)
         return;
     }
 
+    string asteroidStatus;
+    if (TryGetAsteroidStatus(asteroidNum, out asteroidStatus))
+    {
+        string normalized = asteroidStatus.Trim().ToLowerInvariant();
+        if (normalized == "complete" || normalized == "completed")
+        {
+            Echo($"Mine: asteroid {asteroidNum:D3} is already marked '{asteroidStatus}'. Aborting.");
+            return;
+        }
+    }
+    else
+        Echo($"Mine: asteroid {asteroidNum:D3} has no status entry in Zone DB. Proceeding.");
+
     Vector3D savedPos, savedForward, savedUp;
     if (!TryGetCarrierPoseFromZoneDb(asteroidNum, out savedPos, out savedForward, out savedUp))
     {
@@ -647,6 +660,12 @@ void UpdateMineSequence()
     {
         if (!IsAtTargetPose(mineFrontApproachPoint, mineSavedForward, mineSavedUp))
             return;
+
+        int completedAsteroid = mineAsteroidNum;
+        if (TrySetAsteroidStatus(completedAsteroid, "Completed"))
+            Echo($"Mine: asteroid {completedAsteroid:D3} status set to Completed.");
+        else
+            Echo($"Mine: warning - could not set asteroid {completedAsteroid:D3} status to Completed.");
 
         autopilotEnabled = false;
         hasTarget = false;
@@ -1401,6 +1420,100 @@ bool IsAsteroidLabelLine(string line, out int asteroidNum)
     if (line.Length != 3)
         return false;
     return int.TryParse(line, out asteroidNum);
+}
+
+bool TryGetAsteroidStatus(int asteroidNum, out string status)
+{
+    status = "";
+    IMyTimerBlock zoneDb = FindZoneDbTimer();
+    if (zoneDb == null)
+        return false;
+
+    string label = asteroidNum.ToString("D3");
+    string[] lines = (zoneDb.CustomData ?? "").Split(new[] { '\n', '\r' }, StringSplitOptions.None);
+    for (int i = 0; i < lines.Length; i++)
+    {
+        if (!string.Equals(lines[i].Trim(), label, StringComparison.OrdinalIgnoreCase))
+            continue;
+
+        for (int j = i + 1; j < lines.Length; j++)
+        {
+            string t = lines[j].Trim();
+            if (string.IsNullOrWhiteSpace(t))
+                continue;
+
+            int nextNum;
+            if (IsAsteroidLabelLine(t, out nextNum) ||
+                t.IndexOf(asteroidDbTagPfx, StringComparison.OrdinalIgnoreCase) >= 0)
+                break;
+
+            if (t.StartsWith("Status:", StringComparison.OrdinalIgnoreCase))
+            {
+                status = t.Substring("Status:".Length).Trim();
+                return true;
+            }
+        }
+        break;
+    }
+
+    return false;
+}
+
+bool TrySetAsteroidStatus(int asteroidNum, string newStatus)
+{
+    IMyTimerBlock zoneDb = FindZoneDbTimer();
+    if (zoneDb == null)
+        return false;
+
+    var lines = new List<string>((zoneDb.CustomData ?? "").Split('\n'));
+    string label = asteroidNum.ToString("D3");
+    for (int i = 0; i < lines.Count; i++)
+    {
+        if (!string.Equals(lines[i].Trim(), label, StringComparison.OrdinalIgnoreCase))
+            continue;
+
+        int gpsIdx = -1;
+        int oresIdx = -1;
+        int statusIdx = -1;
+        int insertAt = i + 1;
+
+        for (int j = i + 1; j < lines.Count; j++)
+        {
+            string t = lines[j].Trim();
+            if (string.IsNullOrWhiteSpace(t))
+                continue;
+
+            int nextNum;
+            if (IsAsteroidLabelLine(t, out nextNum) ||
+                t.IndexOf(asteroidDbTagPfx, StringComparison.OrdinalIgnoreCase) >= 0)
+                break;
+
+            insertAt = j + 1;
+            if (gpsIdx < 0 && t.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+                gpsIdx = j;
+            else if (t.StartsWith("Ores:", StringComparison.OrdinalIgnoreCase))
+                oresIdx = j;
+            else if (t.StartsWith("Status:", StringComparison.OrdinalIgnoreCase))
+            {
+                statusIdx = j;
+                break;
+            }
+        }
+
+        string statusLine = "Status: " + newStatus;
+        if (statusIdx >= 0)
+            lines[statusIdx] = statusLine;
+        else
+        {
+            int at = oresIdx >= 0 ? oresIdx + 1 : (gpsIdx >= 0 ? gpsIdx + 1 : insertAt);
+            lines.Insert(Math.Max(i + 1, at), statusLine);
+        }
+
+        zoneDb.CustomData = string.Join("\n", lines).TrimEnd();
+        return true;
+    }
+
+    return false;
 }
 
 // ---- State persistence ----
