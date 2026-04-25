@@ -6,7 +6,7 @@
 // Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward  : auto-derive up/forward toward target
 // stop         : disable autopilot and release controls
 // start        : enable autopilot (requires a target)
-// clear        : clear target and all path state
+// reset        : clear target and all path state
 // dumpgps      : save current GPS + orientation to Custom Data
 // pathstart    : load records from "Carrier Path" timer and execute row-by-row
 // pathpause    : pause path execution
@@ -23,12 +23,15 @@
 //                    into the miner's "EMM-A Mi Path" timer, replacing its current content.
 // GoTo <n>         : approach saved Asteroid <n> from a safe side-point, then fly/align to saved
 //                    carrier pose while avoiding the asteroid bubble around the saved site.
+// Mine <n>         : orchestrates GoTo <n> -> LoadAsteroid <n> -> miner PathStart -> wait for miner
+//                    path completion broadcast -> move to front approach point and finish.
 // =====================================
 
 // ========== Editable Script Settings ==========
 string carrierConnectorName   = "EMM-A Ca Connector";
 string carrierRemoteName      = "EMM-A Ca Remote Control";
 string dockBroadcastTag       = "EMM_A_DOCK_POSE";
+string minerPathCompleteTag   = "EMM_A_MINER_PATH_COMPLETE";
 double broadcastForwardOffset = 1.25;
 UpdateFrequency tickSpeed     = UpdateFrequency.Update1;
 double maxSpeed               = 25;
@@ -50,14 +53,24 @@ string asteroidHeaderLine = "---------------------------------------------------
 double goToLeadDistanceMeters = 1000;
 double goToBubbleOffsetMeters = 150;
 double goToBubbleRadiusMeters = 750;
+double mineStationarySpeedMps = 0.20;
+int mineStationaryConfirmTicks = 30;
+string indicatorLightName = "EMM-A Ca Indicator light";
+double indicatorLightDelaySeconds = 0.5;
 // =============================================
 
 IMyShipController rc;
 ThrusterControl thrust;
 GyroControl gyros;
 IMyShipConnector carrierConnector;
+IMyLightingBlock indicatorLight;
 List<IMyGyro>   allGyros     = new List<IMyGyro>();
 List<IMyThrust> allThrusters = new List<IMyThrust>();
+int indicatorDelayTicksRemaining = 0;
+enum IndicatorTransitionState { None, WaitEnableAfterColor, WaitNeutralAfterDisable }
+IndicatorTransitionState indicatorTransition = IndicatorTransitionState.None;
+readonly Color indicatorAutopilotColor = new Color(0, 200, 255);
+readonly Color indicatorNeutralColor = Color.White;
 
 Vector3D targetPosition  = Vector3D.Zero;
 bool hasTarget           = false;
@@ -80,6 +93,25 @@ IMyTimerBlock _cachedZoneDbTimer;
 
 bool goToMode = false;
 int goToStage = 0; // 1 = flying to safe side-point, 2 = final approach to saved carrier pose
+IMyBroadcastListener minerPathCompleteListener;
+
+enum MineSequenceState
+{
+    None,
+    GoingTo,
+    WaitingForStationary,
+    WaitingMinerPathComplete,
+    ReturningToFrontApproach
+}
+
+MineSequenceState mineSequenceState = MineSequenceState.None;
+int mineAsteroidNum = 0;
+Vector3D mineSavedPos = Vector3D.Zero;
+Vector3D mineSavedForward = Vector3D.Zero;
+Vector3D mineSavedUp = Vector3D.Zero;
+Vector3D mineFrontApproachPoint = Vector3D.Zero;
+bool minerPathCompleteReceived = false;
+int mineStationaryTicks = 0;
 
 public Program()
 {
@@ -90,6 +122,7 @@ public Program()
         throw new Exception("No remote control found. Set carrierRemoteName.");
 
     carrierConnector = GridTerminalSystem.GetBlockWithName(carrierConnectorName) as IMyShipConnector;
+    indicatorLight = GridTerminalSystem.GetBlockWithName(indicatorLightName) as IMyLightingBlock;
 
     allGyros     = GetBlocks<IMyGyro>().FindAll(b => HasCarrierTag(b));
     allThrusters = GetBlocks<IMyThrust>().FindAll(b => HasCarrierTag(b));
@@ -102,6 +135,7 @@ public Program()
         secondsPerTick = 100.0 / 60.0;
 
     LoadState();
+    minerPathCompleteListener = IGC.RegisterBroadcastListener(minerPathCompleteTag);
     Echo("Ready.");
     Runtime.UpdateFrequency = tickSpeed;
 }
@@ -120,6 +154,7 @@ public void Main(string argument, UpdateType updateSource)
             carrierConnector = GridTerminalSystem.GetBlockWithName(carrierConnectorName) as IMyShipConnector;
 
         BroadcastDockPose();
+        PollMinerPathCompletion();
 
         if (runtime % echoFrequency == 0)
         {
@@ -133,13 +168,94 @@ public void Main(string argument, UpdateType updateSource)
             ResetMovement();
 
         UpdateGoToRunner();
+        UpdateMineSequence();
         UpdatePathRunner();
+        UpdateIndicatorLight();
         runtime++;
     }
     else
     {
         RemoteCommand(argument);
     }
+}
+
+int GetIndicatorDelayTicks()
+{
+    return Math.Max(1, (int)Math.Ceiling(indicatorLightDelaySeconds / Math.Max(0.001, secondsPerTick)));
+}
+
+void UpdateIndicatorLight()
+{
+    if (indicatorLight == null)
+        indicatorLight = GridTerminalSystem.GetBlockWithName(indicatorLightName) as IMyLightingBlock;
+    if (indicatorLight == null)
+        return;
+
+    bool desiredOn = autopilotEnabled;
+    Color desiredOnColor = indicatorAutopilotColor;
+
+    if (desiredOn)
+    {
+        if (indicatorTransition == IndicatorTransitionState.WaitNeutralAfterDisable)
+        {
+            indicatorTransition = IndicatorTransitionState.None;
+            indicatorDelayTicksRemaining = 0;
+        }
+
+        if (!indicatorLight.Enabled)
+        {
+            if (indicatorTransition != IndicatorTransitionState.WaitEnableAfterColor)
+            {
+                indicatorLight.Color = desiredOnColor; // set color first
+                indicatorDelayTicksRemaining = GetIndicatorDelayTicks();
+                indicatorTransition = IndicatorTransitionState.WaitEnableAfterColor;
+            }
+            else
+            {
+                indicatorLight.Color = desiredOnColor;
+                indicatorDelayTicksRemaining--;
+                if (indicatorDelayTicksRemaining <= 0)
+                {
+                    indicatorLight.Enabled = true; // turn on after delay
+                    indicatorTransition = IndicatorTransitionState.None;
+                }
+            }
+        }
+        else
+        {
+            indicatorLight.Color = desiredOnColor;
+            indicatorTransition = IndicatorTransitionState.None;
+            indicatorDelayTicksRemaining = 0;
+        }
+        return;
+    }
+
+    if (indicatorTransition == IndicatorTransitionState.WaitEnableAfterColor)
+    {
+        indicatorTransition = IndicatorTransitionState.None;
+        indicatorDelayTicksRemaining = 0;
+    }
+
+    if (indicatorLight.Enabled)
+    {
+        indicatorLight.Enabled = false; // turn off first
+        indicatorDelayTicksRemaining = GetIndicatorDelayTicks();
+        indicatorTransition = IndicatorTransitionState.WaitNeutralAfterDisable;
+        return;
+    }
+
+    if (indicatorTransition == IndicatorTransitionState.WaitNeutralAfterDisable)
+    {
+        indicatorDelayTicksRemaining--;
+        if (indicatorDelayTicksRemaining <= 0)
+        {
+            indicatorLight.Color = indicatorNeutralColor; // set neutral after off delay
+            indicatorTransition = IndicatorTransitionState.None;
+        }
+        return;
+    }
+
+    indicatorLight.Color = indicatorNeutralColor;
 }
 
 void BroadcastDockPose()
@@ -177,6 +293,8 @@ void WriteEcho()
     sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
     if (pathMode)
         sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
+    if (mineSequenceState != MineSequenceState.None)
+        sb.AppendLine($"Mine: {mineSequenceState} ({mineAsteroidNum:D3})");
     sb.AppendLine($"Connector: {(carrierConnector != null ? carrierConnector.CustomName : "<missing>")}");
     sb.AppendLine("Dock broadcast: " + dockBroadcastTag);
     Echo(sb.ToString());
@@ -295,6 +413,11 @@ void RemoteCommand(string command)
         HandleGoTo(trimmed);
         return;
     }
+    if (trimmed.StartsWith("mine ", StringComparison.OrdinalIgnoreCase))
+    {
+        StartMineSequence(trimmed);
+        return;
+    }
 
     switch (trimmed.ToLower())
     {
@@ -310,11 +433,16 @@ void RemoteCommand(string command)
             WriteEcho();
             break;
         case "clear":
+        case "reset":
             hasTarget           = false;
             desiredForward      = Vector3D.Zero;
             desiredUp           = Vector3D.Zero;
             goToMode            = false;
             goToStage           = 0;
+            mineSequenceState   = MineSequenceState.None;
+            mineAsteroidNum     = 0;
+            minerPathCompleteReceived = false;
+            mineStationaryTicks = 0;
             pathMode            = false;
             pathPaused          = false;
             pathPausedNavResume = false;
@@ -400,6 +528,154 @@ void UpdatePathRunner()
     }
 
     StartNextPathRecord();
+}
+
+void PollMinerPathCompletion()
+{
+    if (minerPathCompleteListener == null)
+        return;
+
+    while (minerPathCompleteListener.HasPendingMessage)
+    {
+        MyIGCMessage msg = minerPathCompleteListener.AcceptMessage();
+        string payload = msg.Data as string;
+        if (!string.IsNullOrWhiteSpace(payload))
+            Echo($"Miner broadcast: {payload}");
+        minerPathCompleteReceived = true;
+    }
+}
+
+void StartMineSequence(string argument)
+{
+    string[] parts = argument.Split(new[] { ' ' }, 2, StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length < 2)
+    {
+        Echo("Usage: Mine <number>  e.g. Mine 032");
+        return;
+    }
+
+    int asteroidNum;
+    if (!int.TryParse(parts[1].Trim(), out asteroidNum) || asteroidNum < 1)
+    {
+        Echo($"Mine: invalid number '{parts[1].Trim()}'.");
+        return;
+    }
+
+    string asteroidStatus;
+    if (TryGetAsteroidStatus(asteroidNum, out asteroidStatus))
+    {
+        string normalized = asteroidStatus.Trim().ToLowerInvariant();
+        if (normalized == "complete" || normalized == "completed")
+        {
+            Echo($"Mine: asteroid {asteroidNum:D3} is already marked '{asteroidStatus}'. Aborting.");
+            return;
+        }
+    }
+    else
+        Echo($"Mine: asteroid {asteroidNum:D3} has no status entry in Zone DB. Proceeding.");
+
+    Vector3D savedPos, savedForward, savedUp;
+    if (!TryGetCarrierPoseFromZoneDb(asteroidNum, out savedPos, out savedForward, out savedUp))
+    {
+        Echo($"Mine: asteroid {asteroidNum:D3} not found in Zone DB.");
+        return;
+    }
+    if (savedForward.LengthSquared() < 0.001 || savedUp.LengthSquared() < 0.001)
+    {
+        Echo($"Mine: asteroid {asteroidNum:D3} saved carrier orientation is invalid.");
+        return;
+    }
+
+    mineAsteroidNum = asteroidNum;
+    mineSavedPos = savedPos;
+    mineSavedForward = savedForward;
+    mineSavedUp = savedUp;
+    mineFrontApproachPoint = savedPos + savedForward * goToLeadDistanceMeters;
+    minerPathCompleteReceived = false;
+    mineStationaryTicks = 0;
+
+    HandleGoTo("GoTo " + asteroidNum.ToString("D3"));
+    if (!goToMode)
+    {
+        Echo("Mine: unable to start GoTo.");
+        return;
+    }
+
+    mineSequenceState = MineSequenceState.GoingTo;
+    Echo($"Mine: sequence started for asteroid {asteroidNum:D3}.");
+}
+
+void UpdateMineSequence()
+{
+    if (mineSequenceState == MineSequenceState.None)
+        return;
+
+    if (mineSequenceState == MineSequenceState.GoingTo)
+    {
+        if (goToMode)
+            return;
+
+        mineSequenceState = MineSequenceState.WaitingForStationary;
+        mineStationaryTicks = 0;
+        Echo($"Mine: GoTo complete. Waiting to be stationary before starting miner for asteroid {mineAsteroidNum:D3}.");
+        return;
+    }
+
+    if (mineSequenceState == MineSequenceState.WaitingForStationary)
+    {
+        double speed = rc.GetShipVelocities().LinearVelocity.Length();
+        if (speed <= Math.Max(0, mineStationarySpeedMps))
+            mineStationaryTicks++;
+        else
+            mineStationaryTicks = 0;
+
+        if (mineStationaryTicks < Math.Max(1, mineStationaryConfirmTicks))
+            return;
+
+        LoadAsteroid("LoadAsteroid " + mineAsteroidNum.ToString("D3"));
+        SendMinerCommand("PathStart");
+        mineSequenceState = MineSequenceState.WaitingMinerPathComplete;
+        mineStationaryTicks = 0;
+        Echo($"Mine: waiting for miner completion broadcast for asteroid {mineAsteroidNum:D3}.");
+        return;
+    }
+
+    if (mineSequenceState == MineSequenceState.WaitingMinerPathComplete)
+    {
+        if (!minerPathCompleteReceived)
+            return;
+
+        targetPosition = mineFrontApproachPoint;
+        desiredForward = mineSavedForward;
+        desiredUp = mineSavedUp;
+        hasTarget = true;
+        autopilotEnabled = true;
+        activeMaxSpeed = maxSpeed;
+        mineSequenceState = MineSequenceState.ReturningToFrontApproach;
+        Echo($"Mine: miner complete. Returning to front approach point for asteroid {mineAsteroidNum:D3}.");
+        return;
+    }
+
+    if (mineSequenceState == MineSequenceState.ReturningToFrontApproach)
+    {
+        if (!IsAtTargetPose(mineFrontApproachPoint, mineSavedForward, mineSavedUp))
+            return;
+
+        int completedAsteroid = mineAsteroidNum;
+        if (TrySetAsteroidStatus(completedAsteroid, "Completed"))
+            Echo($"Mine: asteroid {completedAsteroid:D3} status set to Completed.");
+        else
+            Echo($"Mine: warning - could not set asteroid {completedAsteroid:D3} status to Completed.");
+
+        autopilotEnabled = false;
+        hasTarget = false;
+        activeMaxSpeed = 0;
+        mineSequenceState = MineSequenceState.None;
+        mineAsteroidNum = 0;
+        minerPathCompleteReceived = false;
+        mineStationaryTicks = 0;
+        Echo("Mine: sequence complete.");
+    }
 }
 
 void StartPathFromTimer()
@@ -1146,6 +1422,100 @@ bool IsAsteroidLabelLine(string line, out int asteroidNum)
     return int.TryParse(line, out asteroidNum);
 }
 
+bool TryGetAsteroidStatus(int asteroidNum, out string status)
+{
+    status = "";
+    IMyTimerBlock zoneDb = FindZoneDbTimer();
+    if (zoneDb == null)
+        return false;
+
+    string label = asteroidNum.ToString("D3");
+    string[] lines = (zoneDb.CustomData ?? "").Split(new[] { '\n', '\r' }, StringSplitOptions.None);
+    for (int i = 0; i < lines.Length; i++)
+    {
+        if (!string.Equals(lines[i].Trim(), label, StringComparison.OrdinalIgnoreCase))
+            continue;
+
+        for (int j = i + 1; j < lines.Length; j++)
+        {
+            string t = lines[j].Trim();
+            if (string.IsNullOrWhiteSpace(t))
+                continue;
+
+            int nextNum;
+            if (IsAsteroidLabelLine(t, out nextNum) ||
+                t.IndexOf(asteroidDbTagPfx, StringComparison.OrdinalIgnoreCase) >= 0)
+                break;
+
+            if (t.StartsWith("Status:", StringComparison.OrdinalIgnoreCase))
+            {
+                status = t.Substring("Status:".Length).Trim();
+                return true;
+            }
+        }
+        break;
+    }
+
+    return false;
+}
+
+bool TrySetAsteroidStatus(int asteroidNum, string newStatus)
+{
+    IMyTimerBlock zoneDb = FindZoneDbTimer();
+    if (zoneDb == null)
+        return false;
+
+    var lines = new List<string>((zoneDb.CustomData ?? "").Split('\n'));
+    string label = asteroidNum.ToString("D3");
+    for (int i = 0; i < lines.Count; i++)
+    {
+        if (!string.Equals(lines[i].Trim(), label, StringComparison.OrdinalIgnoreCase))
+            continue;
+
+        int gpsIdx = -1;
+        int oresIdx = -1;
+        int statusIdx = -1;
+        int insertAt = i + 1;
+
+        for (int j = i + 1; j < lines.Count; j++)
+        {
+            string t = lines[j].Trim();
+            if (string.IsNullOrWhiteSpace(t))
+                continue;
+
+            int nextNum;
+            if (IsAsteroidLabelLine(t, out nextNum) ||
+                t.IndexOf(asteroidDbTagPfx, StringComparison.OrdinalIgnoreCase) >= 0)
+                break;
+
+            insertAt = j + 1;
+            if (gpsIdx < 0 && t.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+                gpsIdx = j;
+            else if (t.StartsWith("Ores:", StringComparison.OrdinalIgnoreCase))
+                oresIdx = j;
+            else if (t.StartsWith("Status:", StringComparison.OrdinalIgnoreCase))
+            {
+                statusIdx = j;
+                break;
+            }
+        }
+
+        string statusLine = "Status: " + newStatus;
+        if (statusIdx >= 0)
+            lines[statusIdx] = statusLine;
+        else
+        {
+            int at = oresIdx >= 0 ? oresIdx + 1 : (gpsIdx >= 0 ? gpsIdx + 1 : insertAt);
+            lines.Insert(Math.Max(i + 1, at), statusLine);
+        }
+
+        zoneDb.CustomData = string.Join("\n", lines).TrimEnd();
+        return true;
+    }
+
+    return false;
+}
+
 // ---- State persistence ----
 
 string V3ToString(Vector3D v)
@@ -1181,6 +1551,14 @@ void SaveState()
     sb.AppendLine("pathCount="          + pathRecords.Count);
     for (int i = 0; i < pathRecords.Count; i++)
         sb.AppendLine("pathRecord" + i + "=" + pathRecords[i]);
+    sb.AppendLine("mineSequenceState=" + (int)mineSequenceState);
+    sb.AppendLine("mineAsteroidNum=" + mineAsteroidNum);
+    sb.AppendLine("mineSavedPos=" + V3ToString(mineSavedPos));
+    sb.AppendLine("mineSavedForward=" + V3ToString(mineSavedForward));
+    sb.AppendLine("mineSavedUp=" + V3ToString(mineSavedUp));
+    sb.AppendLine("mineFrontApproachPoint=" + V3ToString(mineFrontApproachPoint));
+    sb.AppendLine("minerPathCompleteReceived=" + (minerPathCompleteReceived ? "1" : "0"));
+    sb.AppendLine("mineStationaryTicks=" + mineStationaryTicks);
     Storage = sb.ToString();
 }
 
@@ -1223,6 +1601,14 @@ void LoadState()
                 pathRecords.Add(s);
         }
     }
+    if (dict.TryGetValue("mineSequenceState", out s) && int.TryParse(s, out n)) mineSequenceState = (MineSequenceState)n;
+    if (dict.TryGetValue("mineAsteroidNum", out s) && int.TryParse(s, out n)) mineAsteroidNum = n;
+    if (dict.TryGetValue("mineSavedPos", out s) && TryParseV3(s, out v)) mineSavedPos = v;
+    if (dict.TryGetValue("mineSavedForward", out s) && TryParseV3(s, out v)) mineSavedForward = v;
+    if (dict.TryGetValue("mineSavedUp", out s) && TryParseV3(s, out v)) mineSavedUp = v;
+    if (dict.TryGetValue("mineFrontApproachPoint", out s) && TryParseV3(s, out v)) mineFrontApproachPoint = v;
+    if (dict.TryGetValue("minerPathCompleteReceived", out s)) minerPathCompleteReceived = s == "1";
+    if (dict.TryGetValue("mineStationaryTicks", out s) && int.TryParse(s, out n)) mineStationaryTicks = n;
 }
 
 // ---- Parse helpers ----
