@@ -55,14 +55,22 @@ double goToBubbleOffsetMeters = 150;
 double goToBubbleRadiusMeters = 750;
 double mineStationarySpeedMps = 0.20;
 int mineStationaryConfirmTicks = 30;
+string indicatorLightName = "EMM-A Ca Indicator light";
+double indicatorLightDelaySeconds = 0.5;
 // =============================================
 
 IMyShipController rc;
 ThrusterControl thrust;
 GyroControl gyros;
 IMyShipConnector carrierConnector;
+IMyLightingBlock indicatorLight;
 List<IMyGyro>   allGyros     = new List<IMyGyro>();
 List<IMyThrust> allThrusters = new List<IMyThrust>();
+int indicatorDelayTicksRemaining = 0;
+enum IndicatorTransitionState { None, WaitEnableAfterColor, WaitNeutralAfterDisable }
+IndicatorTransitionState indicatorTransition = IndicatorTransitionState.None;
+readonly Color indicatorAutopilotColor = new Color(0, 200, 255);
+readonly Color indicatorNeutralColor = Color.White;
 
 Vector3D targetPosition  = Vector3D.Zero;
 bool hasTarget           = false;
@@ -114,6 +122,7 @@ public Program()
         throw new Exception("No remote control found. Set carrierRemoteName.");
 
     carrierConnector = GridTerminalSystem.GetBlockWithName(carrierConnectorName) as IMyShipConnector;
+    indicatorLight = GridTerminalSystem.GetBlockWithName(indicatorLightName) as IMyLightingBlock;
 
     allGyros     = GetBlocks<IMyGyro>().FindAll(b => HasCarrierTag(b));
     allThrusters = GetBlocks<IMyThrust>().FindAll(b => HasCarrierTag(b));
@@ -161,12 +170,92 @@ public void Main(string argument, UpdateType updateSource)
         UpdateGoToRunner();
         UpdateMineSequence();
         UpdatePathRunner();
+        UpdateIndicatorLight();
         runtime++;
     }
     else
     {
         RemoteCommand(argument);
     }
+}
+
+int GetIndicatorDelayTicks()
+{
+    return Math.Max(1, (int)Math.Ceiling(indicatorLightDelaySeconds / Math.Max(0.001, secondsPerTick)));
+}
+
+void UpdateIndicatorLight()
+{
+    if (indicatorLight == null)
+        indicatorLight = GridTerminalSystem.GetBlockWithName(indicatorLightName) as IMyLightingBlock;
+    if (indicatorLight == null)
+        return;
+
+    bool desiredOn = autopilotEnabled;
+    Color desiredOnColor = indicatorAutopilotColor;
+
+    if (desiredOn)
+    {
+        if (indicatorTransition == IndicatorTransitionState.WaitNeutralAfterDisable)
+        {
+            indicatorTransition = IndicatorTransitionState.None;
+            indicatorDelayTicksRemaining = 0;
+        }
+
+        if (!indicatorLight.Enabled)
+        {
+            if (indicatorTransition != IndicatorTransitionState.WaitEnableAfterColor)
+            {
+                indicatorLight.Color = desiredOnColor; // set color first
+                indicatorDelayTicksRemaining = GetIndicatorDelayTicks();
+                indicatorTransition = IndicatorTransitionState.WaitEnableAfterColor;
+            }
+            else
+            {
+                indicatorLight.Color = desiredOnColor;
+                indicatorDelayTicksRemaining--;
+                if (indicatorDelayTicksRemaining <= 0)
+                {
+                    indicatorLight.Enabled = true; // turn on after delay
+                    indicatorTransition = IndicatorTransitionState.None;
+                }
+            }
+        }
+        else
+        {
+            indicatorLight.Color = desiredOnColor;
+            indicatorTransition = IndicatorTransitionState.None;
+            indicatorDelayTicksRemaining = 0;
+        }
+        return;
+    }
+
+    if (indicatorTransition == IndicatorTransitionState.WaitEnableAfterColor)
+    {
+        indicatorTransition = IndicatorTransitionState.None;
+        indicatorDelayTicksRemaining = 0;
+    }
+
+    if (indicatorLight.Enabled)
+    {
+        indicatorLight.Enabled = false; // turn off first
+        indicatorDelayTicksRemaining = GetIndicatorDelayTicks();
+        indicatorTransition = IndicatorTransitionState.WaitNeutralAfterDisable;
+        return;
+    }
+
+    if (indicatorTransition == IndicatorTransitionState.WaitNeutralAfterDisable)
+    {
+        indicatorDelayTicksRemaining--;
+        if (indicatorDelayTicksRemaining <= 0)
+        {
+            indicatorLight.Color = indicatorNeutralColor; // set neutral after off delay
+            indicatorTransition = IndicatorTransitionState.None;
+        }
+        return;
+    }
+
+    indicatorLight.Color = indicatorNeutralColor;
 }
 
 void BroadcastDockPose()

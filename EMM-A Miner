@@ -59,6 +59,9 @@ bool dockUseMergerAssist = true;
 bool dockSyncMode = true;
 string dockBroadcastTag = "EMM_A_DOCK_POSE";
 string minerPathCompleteTag = "EMM_A_MINER_PATH_COMPLETE";
+string indicatorLightName = "EMM-A Mi Indicator light";
+double indicatorLightDelaySeconds = 0.5;
+double indicatorFlashGreenSeconds = 1.0;
 double dockPoseDistance = 50.0;
 double dockApproachSpeed = 15.0;
 double dockFinalSpeed = 15.0;
@@ -157,6 +160,7 @@ IMyShipConnector carrierConnector;
 IMyRemoteControl carrierRemote;
 IMyShipMergeBlock minerMerger;
 IMyShipMergeBlock carrierMerger;
+IMyLightingBlock indicatorLight;
 IMyBroadcastListener dockListener;
 List<IMyGyro> allGyros = new List<IMyGyro>();
 List<IMyThrust> allThrusters = new List<IMyThrust>();
@@ -201,6 +205,13 @@ List<MyInventoryItem> _invItems = new List<MyInventoryItem>();
 bool _invCached = false;
 // Cached path timer reference to avoid repeated GTS scans during path recording
 IMyTimerBlock _cachedPathTimer;
+int indicatorDelayTicksRemaining = 0;
+int indicatorFlashTicksRemaining = 0;
+enum IndicatorTransitionState { None, WaitEnableAfterColor, WaitNeutralAfterDisable }
+IndicatorTransitionState indicatorTransition = IndicatorTransitionState.None;
+readonly Color indicatorAutopilotColor = new Color(0, 200, 255);
+readonly Color indicatorFlashColor = new Color(0, 255, 0);
+readonly Color indicatorNeutralColor = Color.White;
 
 public Program ()
 {
@@ -226,6 +237,7 @@ public Program ()
     carrierRemote = GetBlock<IMyRemoteControl>(carrierRemoteName, true);
     minerMerger = GetBlock<IMyShipMergeBlock>(minerMergerName, true);
     carrierMerger = GetBlock<IMyShipMergeBlock>(carrierMergerName, true);
+    indicatorLight = GetBlock<IMyLightingBlock>(indicatorLightName, true);
     dockListener = IGC.RegisterBroadcastListener(dockBroadcastTag);
     dockListener.SetMessageCallback("dockpose");
     UpdateConnectorOffsetLocal();
@@ -273,6 +285,7 @@ public void Main (string argument, UpdateType updateSource)
         UpdatePathRunner();
         if (oreTransferActive)
             UpdateOreTransfer();
+        UpdateIndicatorLight();
         runtime++;
     }
     else
@@ -896,9 +909,106 @@ void SavePathGpsRecord()
     string idx = pathRecordCounter.ToString("000");
     string line = FormatCurrentGps(idx);
     if (AppendPathRecordLine(line))
+    {
+        TriggerPathPointFlash();
         Echo($"Path point saved: {idx}");
+    }
     else
         Echo($"Could not save path point {idx}; timer tag '{pathTimerTag}' not found.");
+}
+
+int GetIndicatorDelayTicks()
+{
+    return Math.Max(1, (int)Math.Ceiling(indicatorLightDelaySeconds / Math.Max(0.001, secondsPerTick)));
+}
+
+int GetFlashGreenTicks()
+{
+    return Math.Max(1, (int)Math.Ceiling(indicatorFlashGreenSeconds / Math.Max(0.001, secondsPerTick)));
+}
+
+void TriggerPathPointFlash()
+{
+    int minTicks = GetIndicatorDelayTicks() + GetFlashGreenTicks();
+    indicatorFlashTicksRemaining = Math.Max(indicatorFlashTicksRemaining, minTicks);
+}
+
+void UpdateIndicatorLight()
+{
+    if (indicatorLight == null)
+        indicatorLight = GetBlock<IMyLightingBlock>(indicatorLightName, true);
+    if (indicatorLight == null)
+        return;
+
+    bool flashGreen = indicatorFlashTicksRemaining > 0;
+    if (indicatorFlashTicksRemaining > 0)
+        indicatorFlashTicksRemaining--;
+
+    bool desiredOn = autopilotEnabled || flashGreen;
+    Color desiredOnColor = flashGreen ? indicatorFlashColor : indicatorAutopilotColor;
+
+    if (desiredOn)
+    {
+        if (indicatorTransition == IndicatorTransitionState.WaitNeutralAfterDisable)
+        {
+            indicatorTransition = IndicatorTransitionState.None;
+            indicatorDelayTicksRemaining = 0;
+        }
+
+        if (!indicatorLight.Enabled)
+        {
+            if (indicatorTransition != IndicatorTransitionState.WaitEnableAfterColor)
+            {
+                indicatorLight.Color = desiredOnColor; // set color first
+                indicatorDelayTicksRemaining = GetIndicatorDelayTicks();
+                indicatorTransition = IndicatorTransitionState.WaitEnableAfterColor;
+            }
+            else
+            {
+                indicatorLight.Color = desiredOnColor;
+                indicatorDelayTicksRemaining--;
+                if (indicatorDelayTicksRemaining <= 0)
+                {
+                    indicatorLight.Enabled = true; // enable after delay
+                    indicatorTransition = IndicatorTransitionState.None;
+                }
+            }
+        }
+        else
+        {
+            indicatorLight.Color = desiredOnColor;
+            indicatorTransition = IndicatorTransitionState.None;
+            indicatorDelayTicksRemaining = 0;
+        }
+        return;
+    }
+
+    if (indicatorTransition == IndicatorTransitionState.WaitEnableAfterColor)
+    {
+        indicatorTransition = IndicatorTransitionState.None;
+        indicatorDelayTicksRemaining = 0;
+    }
+
+    if (indicatorLight.Enabled)
+    {
+        indicatorLight.Enabled = false; // off first
+        indicatorDelayTicksRemaining = GetIndicatorDelayTicks();
+        indicatorTransition = IndicatorTransitionState.WaitNeutralAfterDisable;
+        return;
+    }
+
+    if (indicatorTransition == IndicatorTransitionState.WaitNeutralAfterDisable)
+    {
+        indicatorDelayTicksRemaining--;
+        if (indicatorDelayTicksRemaining <= 0)
+        {
+            indicatorLight.Color = indicatorNeutralColor; // neutral after delay while off
+            indicatorTransition = IndicatorTransitionState.None;
+        }
+        return;
+    }
+
+    indicatorLight.Color = indicatorNeutralColor;
 }
 
 string BuildMineAreaRecord(Vector3D cornerA, Vector3D cornerB, Vector3D up, Vector3D forward, double depth, int index)
