@@ -99,7 +99,7 @@ IMyTimerBlock _cachedPathTimer;
 IMyTimerBlock _cachedZoneDbTimer;
 
 bool goToMode = false;
-int goToStage = 0; // 1 = align to approach point, 2 = move to approach point, 3 = align saved orientation, 4 = move to saved pose
+int goToStage = 0; // 1 = flying to safe side-point, 2 = final approach to saved carrier pose
 IMyBroadcastListener minerPathCompleteListener;
 
 enum MineSequenceState
@@ -301,12 +301,26 @@ string ToCsv(Vector3D v)
 void WriteEcho()
 {
     StringBuilder sb = new StringBuilder();
-    sb.AppendLine("Autopilot Mode");
+    sb.AppendLine("Carrier Autopilot");
     sb.AppendLine(autopilotEnabled ? "State: Enabled" : "State: Disabled");
     if (hasTarget)
         sb.AppendLine($"Target: {targetPosition.ToString("0.00")}");
     else
         sb.AppendLine("Target: <none>");
+    sb.AppendLine("Command example:");
+    sb.AppendLine("Nav;GPS:Site:X:Y:Z:|-0.4942,-0.5045,0.7079,0.5018,0.4994,0.7063");
+    sb.AppendLine("dumpgps");
+    sb.AppendLine($"Path tolerance: {arrivalTolerance:0.00} m");
+    sb.AppendLine($"Orientation tolerance: {orientationToleranceDeg:0.00} deg");
+    sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
+    if (pathMode)
+        sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
+    if (mineSequenceState != MineSequenceState.None)
+        sb.AppendLine($"Mine: {mineSequenceState} ({mineAsteroidNum:D3})");
+    if (fullAutoEnabled)
+        sb.AppendLine("Fullauto: " + (fullAutoWaitingForMine ? $"mining {fullAutoActiveAsteroid:D3}" : "searching"));
+    sb.AppendLine($"Connector: {(carrierConnector != null ? carrierConnector.CustomName : "<missing>")}");
+    sb.AppendLine("Dock broadcast: " + dockBroadcastTag);
     Echo(sb.ToString());
 }
 
@@ -1492,10 +1506,8 @@ void HandleGoTo(string argument)
     }
 
     Vector3D chosenPoint = frontIntersects ? backPoint : frontPoint;
-    Vector3D toApproach = chosenPoint - currentPos;
-    Vector3D alignForward = toApproach.LengthSquared() > 0.001 ? Vector3D.Normalize(toApproach) : savedForward;
-    targetPosition   = currentPos;
-    desiredForward   = alignForward;
+    targetPosition   = chosenPoint;
+    desiredForward   = Vector3D.Zero;
     desiredUp        = savedUp;
     hasTarget        = true;
     autopilotEnabled = true;
@@ -1508,7 +1520,6 @@ void HandleGoTo(string argument)
     pathRecords.Clear();
     pathIndex = 0;
 
-    _goToApproachPoint = chosenPoint;
     _goToFinalPosition = savedPos;
     _goToFinalForward  = savedForward;
     _goToFinalUp       = savedUp;
@@ -1519,44 +1530,23 @@ void HandleGoTo(string argument)
 Vector3D _goToFinalPosition = Vector3D.Zero;
 Vector3D _goToFinalForward  = Vector3D.Zero;
 Vector3D _goToFinalUp       = Vector3D.Zero;
-Vector3D _goToApproachPoint = Vector3D.Zero;
 
 void UpdateGoToRunner()
 {
     if (!goToMode || !autopilotEnabled || !hasTarget)
         return;
 
-    if (goToStage == 1 && IsOrientationAligned(desiredForward, desiredUp, orientationToleranceDeg))
-    {
-        targetPosition = _goToApproachPoint;
-        desiredForward = Vector3D.Zero;
-        desiredUp      = _goToFinalUp;
-        goToStage      = 2;
-        Echo("GoTo: approach heading aligned. Moving to side-point.");
-        return;
-    }
-
-    if (goToStage == 2 && IsAtTargetPosition(_goToApproachPoint))
-    {
-        targetPosition = _goToApproachPoint;
-        desiredForward = _goToFinalForward;
-        desiredUp      = _goToFinalUp;
-        goToStage      = 3;
-        Echo("GoTo: side-point reached. Aligning to final orientation.");
-        return;
-    }
-
-    if (goToStage == 3 && IsOrientationAligned(_goToFinalForward, _goToFinalUp, orientationToleranceDeg))
+    if (goToStage == 1 && IsAtTargetPosition(targetPosition))
     {
         targetPosition = _goToFinalPosition;
         desiredForward = _goToFinalForward;
         desiredUp      = _goToFinalUp;
-        goToStage      = 4;
-        Echo("GoTo: orientation aligned. Starting final approach.");
+        goToStage      = 2;
+        Echo("GoTo: side-point reached. Starting final approach.");
         return;
     }
 
-    if (goToStage == 4 && IsAtTargetPose(_goToFinalPosition, _goToFinalForward, _goToFinalUp))
+    if (goToStage == 2 && IsAtTargetPose(_goToFinalPosition, _goToFinalForward, _goToFinalUp))
     {
         goToMode      = false;
         goToStage     = 0;
