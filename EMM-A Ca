@@ -95,6 +95,8 @@ int pathIndex            = 0;
 double secondsPerTick  = 1.0 / 60.0;
 readonly int echoFrequency = 100;
 int runtime            = 0;
+double runtimePeakLastMinuteMs = 0;
+double runtimePeakWindowElapsedSeconds = 0;
 IMyTimerBlock _cachedPathTimer;
 IMyTimerBlock _cachedZoneDbTimer;
 
@@ -170,6 +172,7 @@ public void Main(string argument, UpdateType updateSource)
 {
     if (updateSource == UpdateType.Update1 || updateSource == UpdateType.Update10 || updateSource == UpdateType.Update100)
     {
+        UpdateRuntimeMetrics();
         if (carrierConnector == null)
             carrierConnector = GridTerminalSystem.GetBlockWithName(carrierConnectorName) as IMyShipConnector;
 
@@ -301,27 +304,29 @@ string ToCsv(Vector3D v)
 void WriteEcho()
 {
     StringBuilder sb = new StringBuilder();
-    sb.AppendLine("Carrier Autopilot");
+    sb.AppendLine("Autopilot Mode");
     sb.AppendLine(autopilotEnabled ? "State: Enabled" : "State: Disabled");
     if (hasTarget)
         sb.AppendLine($"Target: {targetPosition.ToString("0.00")}");
     else
         sb.AppendLine("Target: <none>");
-    sb.AppendLine("Command example:");
-    sb.AppendLine("Nav;GPS:Site:X:Y:Z:|-0.4942,-0.5045,0.7079,0.5018,0.4994,0.7063");
-    sb.AppendLine("dumpgps");
-    sb.AppendLine($"Path tolerance: {arrivalTolerance:0.00} m");
-    sb.AppendLine($"Orientation tolerance: {orientationToleranceDeg:0.00} deg");
-    sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
-    if (pathMode)
-        sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
-    if (mineSequenceState != MineSequenceState.None)
-        sb.AppendLine($"Mine: {mineSequenceState} ({mineAsteroidNum:D3})");
-    if (fullAutoEnabled)
-        sb.AppendLine("Fullauto: " + (fullAutoWaitingForMine ? $"mining {fullAutoActiveAsteroid:D3}" : "searching"));
-    sb.AppendLine($"Connector: {(carrierConnector != null ? carrierConnector.CustomName : "<missing>")}");
-    sb.AppendLine("Dock broadcast: " + dockBroadcastTag);
+    sb.AppendLine($"Runtime (last tick): {Runtime.LastRunTimeMs:0.000} ms");
+    sb.AppendLine($"Runtime peak (last minute): {runtimePeakLastMinuteMs:0.000} ms");
     Echo(sb.ToString());
+}
+
+void UpdateRuntimeMetrics()
+{
+    double lastTickMs = Runtime.LastRunTimeMs;
+    if (lastTickMs > runtimePeakLastMinuteMs)
+        runtimePeakLastMinuteMs = lastTickMs;
+
+    runtimePeakWindowElapsedSeconds += secondsPerTick;
+    if (runtimePeakWindowElapsedSeconds >= 60.0)
+    {
+        runtimePeakLastMinuteMs = lastTickMs;
+        runtimePeakWindowElapsedSeconds = 0;
+    }
 }
 
 void Move()
