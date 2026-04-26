@@ -99,7 +99,7 @@ IMyTimerBlock _cachedPathTimer;
 IMyTimerBlock _cachedZoneDbTimer;
 
 bool goToMode = false;
-int goToStage = 0; // 1 = flying to safe side-point, 2 = final approach to saved carrier pose
+int goToStage = 0; // 1 = align to approach point, 2 = move to approach point, 3 = align saved orientation, 4 = move to saved pose
 IMyBroadcastListener minerPathCompleteListener;
 
 enum MineSequenceState
@@ -1492,8 +1492,10 @@ void HandleGoTo(string argument)
     }
 
     Vector3D chosenPoint = frontIntersects ? backPoint : frontPoint;
-    targetPosition   = chosenPoint;
-    desiredForward   = Vector3D.Zero;
+    Vector3D toApproach = chosenPoint - currentPos;
+    Vector3D alignForward = toApproach.LengthSquared() > 0.001 ? Vector3D.Normalize(toApproach) : savedForward;
+    targetPosition   = currentPos;
+    desiredForward   = alignForward;
     desiredUp        = savedUp;
     hasTarget        = true;
     autopilotEnabled = true;
@@ -1506,6 +1508,7 @@ void HandleGoTo(string argument)
     pathRecords.Clear();
     pathIndex = 0;
 
+    _goToApproachPoint = chosenPoint;
     _goToFinalPosition = savedPos;
     _goToFinalForward  = savedForward;
     _goToFinalUp       = savedUp;
@@ -1516,23 +1519,44 @@ void HandleGoTo(string argument)
 Vector3D _goToFinalPosition = Vector3D.Zero;
 Vector3D _goToFinalForward  = Vector3D.Zero;
 Vector3D _goToFinalUp       = Vector3D.Zero;
+Vector3D _goToApproachPoint = Vector3D.Zero;
 
 void UpdateGoToRunner()
 {
     if (!goToMode || !autopilotEnabled || !hasTarget)
         return;
 
-    if (goToStage == 1 && IsAtTargetPosition(targetPosition))
+    if (goToStage == 1 && IsOrientationAligned(desiredForward, desiredUp, orientationToleranceDeg))
+    {
+        targetPosition = _goToApproachPoint;
+        desiredForward = Vector3D.Zero;
+        desiredUp      = _goToFinalUp;
+        goToStage      = 2;
+        Echo("GoTo: approach heading aligned. Moving to side-point.");
+        return;
+    }
+
+    if (goToStage == 2 && IsAtTargetPosition(_goToApproachPoint))
+    {
+        targetPosition = _goToApproachPoint;
+        desiredForward = _goToFinalForward;
+        desiredUp      = _goToFinalUp;
+        goToStage      = 3;
+        Echo("GoTo: side-point reached. Aligning to final orientation.");
+        return;
+    }
+
+    if (goToStage == 3 && IsOrientationAligned(_goToFinalForward, _goToFinalUp, orientationToleranceDeg))
     {
         targetPosition = _goToFinalPosition;
         desiredForward = _goToFinalForward;
         desiredUp      = _goToFinalUp;
-        goToStage      = 2;
-        Echo("GoTo: side-point reached. Starting final approach.");
+        goToStage      = 4;
+        Echo("GoTo: orientation aligned. Starting final approach.");
         return;
     }
 
-    if (goToStage == 2 && IsAtTargetPose(_goToFinalPosition, _goToFinalForward, _goToFinalUp))
+    if (goToStage == 4 && IsAtTargetPose(_goToFinalPosition, _goToFinalForward, _goToFinalUp))
     {
         goToMode      = false;
         goToStage     = 0;
