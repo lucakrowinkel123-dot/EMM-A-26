@@ -197,6 +197,7 @@ public void Main(string argument, UpdateType updateSource)
     else
     {
         RemoteCommand(argument);
+        SaveState();
     }
 }
 
