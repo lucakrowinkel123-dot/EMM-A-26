@@ -95,6 +95,8 @@ int pathIndex            = 0;
 double secondsPerTick  = 1.0 / 60.0;
 readonly int echoFrequency = 100;
 int runtime            = 0;
+double runtimePeakLastMinuteMs = 0;
+double runtimePeakWindowElapsedSeconds = 0;
 IMyTimerBlock _cachedPathTimer;
 IMyTimerBlock _cachedZoneDbTimer;
 
@@ -170,6 +172,7 @@ public void Main(string argument, UpdateType updateSource)
 {
     if (updateSource == UpdateType.Update1 || updateSource == UpdateType.Update10 || updateSource == UpdateType.Update100)
     {
+        UpdateRuntimeMetrics();
         if (carrierConnector == null)
             carrierConnector = GridTerminalSystem.GetBlockWithName(carrierConnectorName) as IMyShipConnector;
 
@@ -307,7 +310,23 @@ void WriteEcho()
         sb.AppendLine($"Target: {targetPosition.ToString("0.00")}");
     else
         sb.AppendLine("Target: <none>");
+    sb.AppendLine($"Runtime (last tick): {Runtime.LastRunTimeMs:0.000} ms");
+    sb.AppendLine($"Runtime peak (last minute): {runtimePeakLastMinuteMs:0.000} ms");
     Echo(sb.ToString());
+}
+
+void UpdateRuntimeMetrics()
+{
+    double lastTickMs = Runtime.LastRunTimeMs;
+    if (lastTickMs > runtimePeakLastMinuteMs)
+        runtimePeakLastMinuteMs = lastTickMs;
+
+    runtimePeakWindowElapsedSeconds += secondsPerTick;
+    if (runtimePeakWindowElapsedSeconds >= 60.0)
+    {
+        runtimePeakLastMinuteMs = lastTickMs;
+        runtimePeakWindowElapsedSeconds = 0;
+    }
 }
 
 void Move()

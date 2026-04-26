@@ -192,6 +192,8 @@ const int dockConnectRecompileTicks = 30;
 
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
+double runtimePeakLastMinuteMs = 0;
+double runtimePeakWindowElapsedSeconds = 0;
 
 bool oreTransferActive = false;
 int oreTransferSourceIdx = 0;
@@ -263,6 +265,7 @@ public void Main (string argument, UpdateType updateSource)
 {
     if (updateSource == UpdateType.Update100 || updateSource == UpdateType.Update10 || updateSource == UpdateType.Update1)
     {
+        UpdateRuntimeMetrics();
         UpdateDockPoseFromBroadcast();
         if (runtime % echoFrequency == 0)
         {
@@ -304,8 +307,24 @@ void WriteEcho()
         sb.AppendLine($"Target: {targetPosition.ToString("0.00")}");
     else
         sb.AppendLine("Target: <none>");
+    sb.AppendLine($"Runtime (last tick): {Runtime.LastRunTimeMs:0.000} ms");
+    sb.AppendLine($"Runtime peak (last minute): {runtimePeakLastMinuteMs:0.000} ms");
 
     Echo(sb.ToString());
+}
+
+void UpdateRuntimeMetrics()
+{
+    double lastTickMs = Runtime.LastRunTimeMs;
+    if (lastTickMs > runtimePeakLastMinuteMs)
+        runtimePeakLastMinuteMs = lastTickMs;
+
+    runtimePeakWindowElapsedSeconds += secondsPerTick;
+    if (runtimePeakWindowElapsedSeconds >= 60.0)
+    {
+        runtimePeakLastMinuteMs = lastTickMs;
+        runtimePeakWindowElapsedSeconds = 0;
+    }
 }
 
 void Move ()
