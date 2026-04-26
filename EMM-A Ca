@@ -335,18 +335,11 @@ void Move()
     double tolerance = Math.Max(0.05, arrivalTolerance);
     bool atPosition  = toTarget.LengthSquared() < tolerance * tolerance;
     bool aligned     = IsOrientationAligned(forward, up, orientationToleranceDeg);
-    bool mineGoToAlignBeforeMove = mineSequenceState == MineSequenceState.GoingTo && goToMode;
     if (atPosition)
     {
         thrust.Reset();
         if (aligned)
             gyros.Reset();
-        return;
-    }
-
-    if (mineGoToAlignBeforeMove && !aligned)
-    {
-        thrust.Reset();
         return;
     }
 
