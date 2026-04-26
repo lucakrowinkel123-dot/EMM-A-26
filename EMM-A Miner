@@ -304,6 +304,32 @@ void WriteEcho()
         sb.AppendLine($"Target: {targetPosition.ToString("0.00")}");
     else
         sb.AppendLine("Target: <none>");
+    sb.AppendLine("Command example:");
+    sb.AppendLine("Nav;GPS:Site:66288.47:-8270.96:-94039.68:|-0.4942,-0.5045,0.7079,0.5018,0.4994,0.7063");
+    sb.AppendLine("dumpgps");
+    sb.AppendLine($"Path tolerance: {arrivalTolerance:0.00} m");
+    sb.AppendLine($"Mining tolerance: {miningArrivalTolerance:0.00} m");
+    sb.AppendLine($"Orientation tolerance: {orientationToleranceDeg:0.00} deg");
+    sb.AppendLine($"Mining: {miningState}");
+    sb.AppendLine($"SPEEDF: {SPEEDF:0.00} m/s");
+    sb.AppendLine($"SPEEDB: {SPEEDB:0.00} m/s");
+    sb.AppendLine($"MINEH/MINEW: {MINEH:0.00}/{MINEW:0.00} m");
+    sb.AppendLine($"Depth mode: {depthMode}");
+    sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
+    sb.AppendLine($"PathRecord: {(pathRecordingEnabled ? "ON" : "OFF")} {(pathRecordingPaused ? "(paused)" : "")} every {pathRecordMeters:0.0}m");
+    if (pathRecordMineStage != PathRecordMineStage.Idle)
+        sb.AppendLine($"PathRecordMine: {pathRecordMineStage}");
+    if (areaMiningMode && areaLaneAnchors.Count > 0)
+        sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
+    if (pathMode)
+        sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
+    sb.AppendLine($"Docking: {dockingState}");
+    sb.AppendLine($"Dock sync mode: {(dockSyncMode ? "ON" : "OFF")}");
+    sb.AppendLine($"Dock connector: {(minerConnector != null ? minerConnector.CustomName : "<missing>")}");
+    sb.AppendLine($"Carrier pose age: {carrierPoseAgeSeconds:0.0}s");
+    sb.AppendLine("Faceforward = look toward target");
+    sb.AppendLine("Faceup = align up to gravity-up (or current up in space)");
+
     Echo(sb.ToString());
 }
 
